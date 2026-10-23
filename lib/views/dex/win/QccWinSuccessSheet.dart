@@ -14,7 +14,10 @@ class QccWinSuccessSheet extends StatelessWidget {
   static void show(BuildContext context, String responseBody) {
     try {
       final Map<String, dynamic> res = jsonDecode(responseBody);
-      if (res['status'] == 'ACCEPTED') {
+      // 🐛 返回的 status 是小写 accepted，code 才是大写 ACCEPTED；
+      // 原判断 status=='ACCEPTED' 永不成立，每次成交都提示"未被接受"
+      final String code = (res['code'] ?? res['status'] ?? '').toString().toUpperCase();
+      if (code == 'ACCEPTED') {
         showModalBottomSheet(
           context: context,
           isScrollControlled: true,
@@ -38,7 +41,8 @@ class QccWinSuccessSheet extends StatelessWidget {
 
     Map<String, dynamic> txData = {};
     try {
-      txData = jsonDecode(responseData['data']);
+      final d = responseData['data'];
+      txData = d is Map ? Map<String, dynamic>.from(d) : Map<String, dynamic>.from(jsonDecode(d));
     } catch (e) {
       debugPrint("解析 txData 失败: $e");
     }
@@ -73,7 +77,8 @@ class QccWinSuccessSheet extends StatelessWidget {
           const SizedBox(height: 20),
 
           // ✅ 标题与提示
-          const Trans("交易已广播 (ACCEPTED)", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+          Trans(responseData['chainStatus'] == 'confirmed' ? "成交已上链" : "交易已广播 (ACCEPTED)",
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           Text(msg, style: const TextStyle(color: Colors.grey, fontSize: 13)),
 

@@ -11,6 +11,9 @@ import 'package:flutter/material.dart';
 // TxMatchDexTest.java 里 sendTx() 的做法完全对应：单独用 WalletSigner.sign()
 // 对 toSign() 签名，再覆盖 encodeData() 生成的空签名。
 import '../../../procotol/QccTxFlow.dart';
+import '../../../home/QccExplorerService.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
 import '../../../procotol/QccTransactionData.dart';
 import '../../../qccwallet/QccActiveWallet.dart';
 import '../../../utile/QccObj.dart';
@@ -97,12 +100,35 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
     super.dispose();
   }
 
-  // 动态计算预估总额
+  String? _estimateNote; // 买单精度取整后的实际价格说明，显示在预估金额下方
+
+  // 动态计算预估总额 —— 买单走与提交相同的 _calcBuy()，预估即实际锁定量
   void _updateTotal() {
     double price = double.tryParse(_rateController.text) ?? 0.0;
     double amount = double.tryParse(_amountController.text) ?? 0.0;
+    double total = price * amount;
+    String? note;
+    if (_direction == DexUtil.TradeDirection.buy) {
+      try {
+        final int pB = _precisionOf(_baseAssetId);
+        final int pQ = _precisionOf(_quoteAssetId);
+        final _Dec? p = _parseDecimal(_rateController.text.trim());
+        final _Dec? q = _parseDecimal(_amountController.text.trim());
+        if (p != null && q != null && p.value > BigInt.zero && q.value > BigInt.zero &&
+            p.scale <= pQ && q.scale <= pB) {
+          final c = _calcBuy(p, q.toScaled(pB), pB, pQ);
+          total = double.parse(_fmtScaled(c.lockRaw, pQ));
+          if (c.effPrice != p.toPlainString()) {
+            note = "按 $_baseAssetId 精度取整：实际价格 ≈ ${c.effPrice} $_quoteAssetId";
+          }
+        }
+      } catch (_) {
+        // 精度取不到时退回简单乘法显示，提交时会再严格校验
+      }
+    }
     setState(() {
-      _estimatedTotal = price * amount;
+      _estimatedTotal = total;
+      _estimateNote = note;
     });
   }
 
@@ -296,6 +322,14 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
                         ],
                       ),
                     ),
+                    if (_estimateNote != null && _direction == DexUtil.TradeDirection.buy)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4, left: 4),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(_estimateNote!, style: const TextStyle(fontSize: 11, color: Colors.orange)),
+                        ),
+                      ),
 
                     const SizedBox(height: 8),
                     TextField(
@@ -328,7 +362,7 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
         children: [
           Expanded(
             child: GestureDetector(
-              onTap: () => setState(() => _direction = DexUtil.TradeDirection.buy),
+              onTap: () { setState(() => _direction = DexUtil.TradeDirection.buy); _updateTotal(); },
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
@@ -342,7 +376,7 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
           ),
           Expanded(
             child: GestureDetector(
-              onTap: () => setState(() => _direction = DexUtil.TradeDirection.sell),
+              onTap: () { setState(() => _direction = DexUtil.TradeDirection.sell); _updateTotal(); },
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
@@ -449,46 +483,79 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
     if (_fromAddress.isEmpty) { Tools.showToast(context, "请选择发送地址"); return; }
     if (_baseAssetId == _quoteAssetId) { Tools.showToast(context, "标的资产不能与计价资产相同"); return; }
 
-    double qty = double.tryParse(_amountController.text) ?? 0;
-    if (qty <= 0) { Tools.showToast(context, "请输入有效交易数量"); return; }
+    // ══ 精度：全部按资产精度用 BigInt 定点计算，不用 double 做除法 ══
+    // 链上规则（preCheck.validateRatePrecision）：rate 的小数位 ≤ 对价资产(pairAssetId)精度。
+    //   卖单：锁 Base 换 Quote，rate = 价格，            对价 = Quote → 精度 pQ
+    //   买单：锁 Quote 换 Base，rate = 1/价格(Base/Quote)，对价 = Base  → 精度 pB
+    final int pB, pQ;
+    try {
+      pB = _precisionOf(_baseAssetId);
+      pQ = _precisionOf(_quoteAssetId);
+    } catch (e) {
+      Tools.showToast(context, "无法获取资产精度: $e");
+      return;
+    }
 
-    double price = double.tryParse(_rateController.text) ?? 0;
-    if (price <= 0) { Tools.showToast(context, "必须设置有效价格"); return; }
+    final _Dec? qtyDec = _parseDecimal(_amountController.text.trim());
+    if (qtyDec == null || qtyDec.value <= BigInt.zero) { Tools.showToast(context, "请输入有效交易数量"); return; }
+    if (qtyDec.scale > pB) { Tools.showToast(context, "交易数量最多 $pB 位小数（$_baseAssetId 精度）"); return; }
 
+    final _Dec? priceDec = _parseDecimal(_rateController.text.trim());
+    if (priceDec == null || priceDec.value <= BigInt.zero) { Tools.showToast(context, "必须设置有效价格"); return; }
+    if (priceDec.scale > pQ) { Tools.showToast(context, "价格最多 $pQ 位小数（$_quoteAssetId 精度）"); return; }
+
+    final BigInt qtyRaw = qtyDec.toScaled(pB); // Base 最小单位
 
     // 确定最终的底层锁仓逻辑
-    String finalLockedAssetId;
-    String finalTargetAssetId;
-    String finalAmountStr;
-    double finalRate;
+    final String finalLockedAssetId;
+    final String finalTargetAssetId;
+    final BigInt lockRaw;   // 锁定资产的最小单位数量，直接写入 tx.amount
+    final String rateStr;   // 链上 rate 的十进制字符串，已对齐对价资产精度
+    String? priceNotice;    // 买单因精度取整导致实际价格变化时，提交前给用户确认
 
     if (_direction == DexUtil.TradeDirection.sell) {
-      // 🔴 卖单 (Sell): 锁定 Base，换回 Quote
+      // 🔴 卖单：锁定 Base，换回 Quote；rate = 价格，价格已校验 ≤ pQ 位
       finalLockedAssetId = _baseAssetId;
       finalTargetAssetId = _quoteAssetId;
-      finalAmountStr = qty.toStringAsFixed(8); // 锁定数量 = 用户输入的 Base 数量
-      finalRate = price;// 链上汇率 = 价格 (1 Base 换多少 Quote)
-      // ── 汇率精度校验 ──────────────────────────────────────────
-      // 卖单：rate = price，锁定 base，精度对齐 quote 资产
-      // 买单：rate = 1/price，锁定 quote，精度对齐 base 资产
-      final rateError = _direction == DexUtil.TradeDirection.sell
-          ? validateRatePrecision(price,2 )
-          : validateRatePrecision(1.0 / price, 9);
-
-      if (rateError != null) {
-        Tools.showToast(context, rateError);
-        return;
-      }
-
-
+      lockRaw = qtyRaw;
+      rateStr = priceDec.toPlainString();
     } else {
-      // 🟢 买单 (Buy): 锁定 Quote，换回 Base
+      // 🟢 买单：锁定 Quote，换回 Base；rate = 1/价格，必须对齐 Base 精度 pB
       finalLockedAssetId = _quoteAssetId;
       finalTargetAssetId = _baseAssetId;
-      // 锁定数量 = 用户输入的 Base 数量 * 价格 (预估总额)
-      finalAmountStr = _estimatedTotal.toStringAsFixed(8);
-      // 链上汇率 = 倒数 (1 Quote 换多少 Base)
-      finalRate = 1.0 / price;
+      final _BuyCalc c = _calcBuy(priceDec, qtyRaw, pB, pQ);
+      rateStr = c.rateStr;
+      lockRaw = c.lockRaw;
+      if (c.effPrice != priceDec.toPlainString()) {
+        priceNotice = "链上汇率须按 $_baseAssetId 精度（$pB 位）取整：\n"
+            "汇率 1 $_quoteAssetId = $rateStr $_baseAssetId\n"
+            "实际挂单价 ≈ ${c.effPrice} $_quoteAssetId（您的价格 ${priceDec.toPlainString()}）\n"
+            "锁定 ${_fmtScaled(lockRaw, pQ)} $_quoteAssetId，可获得 ≥ ${qtyDec.toPlainString()} $_baseAssetId";
+      }
+    }
+
+    final double finalRate = double.parse(rateStr);
+    // 最终守卫：与链上 validateRatePrecision 同一规则，精度取对价资产
+    final String? rateError = validateRatePrecision(
+        finalRate, _direction == DexUtil.TradeDirection.sell ? pQ : pB);
+    if (rateError != null) {
+      Tools.showToast(context, rateError);
+      return;
+    }
+
+    if (priceNotice != null) {
+      final bool? go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Trans("价格精度调整"),
+          content: Text(priceNotice!, style: const TextStyle(fontSize: 13, height: 1.5)),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Trans("取消")),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Trans("继续挂单")),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
     }
 
     // buildPayload 回调里构建好的 tx 需要在成功之后存本地挂单记录
@@ -509,18 +576,11 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
         final tx = QccTransactionData();
         tx.assetId = finalLockedAssetId;
         tx.from = _fromAddress;
+        tx.fromdev="QQxDj4tZrVA77PA3U1wW91kcmMigkcj5HN";
         tx.to = "DEX_POOL_${DateTime.now().millisecondsSinceEpoch}";
-        tx.amount = QccAssetService().getAmountRaw(finalLockedAssetId, finalAmountStr);
+        tx.amount = lockRaw.toInt(); // 已是锁定资产最小单位，不再经字符串/double 二次换算
         tx.txType = "open";
         tx.memo = _noteController.text;
-        // 【本次修正，对应你的要求"2.对比java优化"里发现的问题】原来这里完全
-        // 没有设置 tx.chain——对照 TxMatchDexTest.java 逐字段核对后发现的真实
-        // bug：Java 每一笔 TransactionData(openTx/winTx/topUp tx) 都显式执行
-        // `tx.chain = tx.getChain();`，而 chain 会参与 toSign()/getPayloadForHash()
-        // 签名计算，留空等于用空字符串去签名、也会把 chain:null 发给服务端，
-        // 大概率被服务端按"链ID不匹配/缺失"直接拒绝。这里补上，取值按本
-        // session 其它已验证页面(QccTransferPage.dart / LoanIssueWidget.dart
-        // 等)统一硬编码的 "6666"，不要在这里自行改成别的值。
         tx.chain = "6666";
         // ✅ DEX 模式的底层 MatchLogic 组装
         tx.matchLogic = QccMatchLogic(
@@ -533,32 +593,158 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
         builtTx = tx;
         return QccSignPayload(toSign: tx.toSign(), payloadJson: jsonEncode(tx.toJson()));
       },
-      submitUrl: "https://tx.qccio.com/v1/txm",
+      // 原来写死 https://tx.qccio.com，统一走 baseUrl
+      submitUrl: "${QccExplorerService.baseUrl}/v1/txm",
     );
 
     if (!mounted) return;
 
     if (result.cancelled) return;
 
-    if (result.success) {
-      final resData = result.data!;
+    final String? txHash = _acceptedTxHash(result, builtTx?.id);
+    if (txHash != null && builtTx != null) {
+      final Map<String, dynamic> resData = Map<String, dynamic>.from(result.data ?? {});
       LogObj.log("返回dex交易内容：$resData");
-      if (builtTx != null) {
-        await QccStorage.saveDexOrder(_fromAddress, builtTx!.toJson()); //保存我的挂单交易单
-      }
-      await showModalBottomSheet(
+      final String from = _fromAddress;
+
+      // 受理即保存本地挂单（状态 pending），超时未确认的挂单也能在「我的交易」里追踪
+      await QccStorage.saveDexOrder(from, {...builtTx!.toJson(), 'localStatus': 'pending'});
+      if (!mounted) return;
+
+      final bool isBuy = _direction == DexUtil.TradeDirection.buy;
+      final TxChainStatus? st = await showDialog<TxChainStatus?>(
         context: context,
-        isScrollControlled: true,
-        backgroundColor: Colors.transparent,
-        builder: (context) => QccTxSuccessWidget(response: resData),
+        barrierDismissible: false,
+        builder: (_) => QccTxConfirmDialog(
+          txHash: txHash,
+          confirmedTitle: "挂单已上链",
+          details: [
+            Text("${isBuy ? '买入' : '卖出'} ${_amountController.text} $_baseAssetId",
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text("价格：${_rateController.text} $_quoteAssetId", style: const TextStyle(fontSize: 12)),
+            Text("锁定：${builtTx!.assetId} ${QccAssetService().getHumanAmount(builtTx!.assetId!, builtTx!.amount.toString())}",
+                style: const TextStyle(fontSize: 12, color: Colors.black54)),
+          ],
+          footer: "挂单上链后才会出现在盘口、才能被他人成交。",
+          onFinal: (s) async {
+            await _updateLocalOrderStatus(from, txHash, s);
+            if (s.state == TxChainState.confirmed) QccOpenDataManager.syncFromNetwork();
+          },
+        ),
       );
-      if (mounted) Navigator.pop(context);
+      if (!mounted) return;
+
+      if (st?.state == TxChainState.confirmed) {
+        await showModalBottomSheet(
+          context: context,
+          isScrollControlled: true,
+          backgroundColor: Colors.transparent,
+          builder: (context) => QccTxSuccessWidget(response: {
+            ...resData,
+            'txHash': txHash,
+            'data': jsonEncode(builtTx!.toJson()), // 新响应不含 data，用本地交易补上
+            'chainStatus': 'confirmed',
+            if (st!.blockHeight != null) 'blockHeight': st.blockHeight,
+          }),
+        );
+        if (mounted) Navigator.pop(context);
+      } else if (st?.state == TxChainState.failed) {
+        Tools.showToast(context, "挂单上链失败：${st!.message ?? '未知原因'}，资产未被锁定");
+      } else {
+        Tools.showToast(context, "挂单已受理，尚未确认上链，请稍后在「我的交易」中查看");
+        if (mounted) Navigator.pop(context);
+      }
     } else {
       LogObj.log("dex挂单异常: ${result.error}");
       Tools.showToast(context, "操作失败: ${result.error}");
     }
   }
 
+  /// 从 QccTxFlow 结果里取出已受理的 txHash。
+  /// 【兜底】QccTxFlow 内部的受理判断我还没看到——如果它也写成
+  /// status=='ACCEPTED'（其他页面都是这个写法），result.success 会是 false，
+  /// 但 data 里其实是受理成功的响应。这里以 code 为准再判断一次，避免把
+  /// 已受理的挂单当成失败、让用户重复下单。
+  static String? _acceptedTxHash(dynamic result, String? localTxId) {
+    final Map? d = result.data is Map ? result.data as Map : null;
+    if (d != null) {
+      final code = (d['code'] ?? d['status'] ?? '').toString().toUpperCase();
+      final h = d['txHash']?.toString() ?? '';
+      if ((result.success == true || code == 'ACCEPTED') && h.isNotEmpty) return h;
+    }
+    // 【临时兜底，根治在 QccTxFlow】实测：QccTxFlow 把受理响应判成失败，
+    // data 为空、只在 error 里带回服务端 msg "Transaction accepted, query by
+    // txHash for final result"。此时用本地 finalizeId() 算出的 id 作为 txHash
+    // （交易 hash 即 id 的 SHA3，与服务端回显一致）。
+    final String err = (result.error ?? '').toString().toLowerCase();
+    if (err.contains('transaction accepted') && localTxId != null && localTxId.isNotEmpty) {
+      return localTxId;
+    }
+    return null;
+  }
+
+  /// 链上结果写回本地挂单记录（QccStorage.getDexOrders / saveAllDexOrders，
+  /// 与 QccOpenDataManager.syncOpenHashStatus 同一套存储）。
+  static Future<void> _updateLocalOrderStatus(String address, String txHash, TxChainStatus s) async {
+    final orders = await QccStorage.getDexOrders(address);
+    final i = orders.indexWhere((e) => e['id'] == txHash);
+    if (i == -1) return;
+    orders[i]['localStatus'] = s.state == TxChainState.confirmed ? 'open' : 'failed';
+    if (s.blockHeight != null) orders[i]['blockHeight'] = s.blockHeight;
+    await QccStorage.saveAllDexOrders(address, orders);
+  }
+
+
+  // ───────────── 定点小数工具（BigInt，避免 double 误差） ─────────────
+
+  /// 资产精度。【假设】QccAssetService.getAmountRaw(asset, "1") 返回 10^精度
+  /// （日志"精度设定: 2, 乘数: 100"即此值），据此反推精度，不依赖未见过的 API。
+  static int _precisionOf(String assetId) {
+    final String s = QccAssetService().getAmountRaw(assetId, "1").toString();
+    if (!RegExp(r'^10*$').hasMatch(s)) {
+      throw StateError("$assetId 乘数异常: $s");
+    }
+    return s.length - 1;
+  }
+
+  /// 解析非负十进制字符串；去掉小数末尾 0。非法返回 null。
+  static _Dec? _parseDecimal(String s) {
+    if (!RegExp(r'^\d+(\.\d+)?$').hasMatch(s)) return null;
+    final parts = s.split('.');
+    final String frac = parts.length > 1 ? parts[1].replaceAll(RegExp(r'0+$'), '') : '';
+    return _Dec(BigInt.parse(parts[0] + frac), frac.length);
+  }
+
+  static BigInt _ceilDiv(BigInt a, BigInt b) => (a + b - BigInt.one) ~/ b;
+
+  /// 买单定点计算 —— 提交与界面预估共用同一函数，两处结果必然一致。
+  ///
+  /// rate = 1/价格，按对价资产(Base)精度 pB **四舍五入**取最近档位。
+  /// 原来用向上取整：0.51 → 1.97（1/0.51=1.9608），偏差 0.47%，锁定 406.1 vs 预估 408；
+  /// 最近档位是 1.96，偏差仅 0.04%。代价：实际价格可能比输入价略高，最多半个档位。
+  /// 锁定 Quote = ceil(qty / rate)，保证 lock × rate ≥ qty。
+  static _BuyCalc _calcBuy(_Dec priceDec, BigInt qtyRaw, int pB, int pQ) {
+    final BigInt tenB = BigInt.from(10).pow(pB);
+    final BigInt tenQ = BigInt.from(10).pow(pQ);
+    final BigInt pDen = BigInt.from(10).pow(priceDec.scale);
+    // rateScaled = round(10^pB × pDen / pNum)
+    final BigInt num = tenB * pDen;
+    BigInt rateScaled = (num * BigInt.two + priceDec.value) ~/ (priceDec.value * BigInt.two);
+    if (rateScaled <= BigInt.zero) rateScaled = BigInt.one; // 价格极高、低于一档时兜底到最小档
+    final BigInt lockRaw = _ceilDiv(qtyRaw * tenQ, rateScaled);
+    final int showP = pQ + 4;
+    final String effPrice = _fmtScaled((tenB * BigInt.from(10).pow(showP)) ~/ rateScaled, showP);
+    return _BuyCalc(_fmtScaled(rateScaled, pB), lockRaw, effPrice);
+  }
+
+  /// v / 10^p 格式化为十进制字符串，去掉末尾 0
+  static String _fmtScaled(BigInt v, int p) {
+    if (p == 0) return v.toString();
+    final String s = v.toString().padLeft(p + 1, '0');
+    final String ip = s.substring(0, s.length - p);
+    final String fp = s.substring(s.length - p).replaceAll(RegExp(r'0+$'), '');
+    return fp.isEmpty ? ip : "$ip.$fp";
+  }
 
   /// 校验 rate 的小数位数是否超过资产精度
   /// 等价于 Java 的 BigDecimal(Double.toString(rate)).stripTrailingZeros().scale()
@@ -603,4 +789,27 @@ class _QccCreateMatchWidgetState extends State<DexMatchWidget> {
     }
     return null;
   }
+}
+/// 定点小数：数值 = value / 10^scale
+class _Dec {
+  final BigInt value;
+  final int scale;
+  const _Dec(this.value, this.scale);
+
+  /// 换算到更高精度 p 的整数（调用方保证 p >= scale）
+  BigInt toScaled(int p) => value * BigInt.from(10).pow(p - scale);
+
+  String toPlainString() {
+    if (scale == 0) return value.toString();
+    final String s = value.toString().padLeft(scale + 1, '0');
+    return "${s.substring(0, s.length - scale)}.${s.substring(s.length - scale)}";
+  }
+}
+
+/// 买单计算结果
+class _BuyCalc {
+  final String rateStr;  // 链上 rate，已对齐 Base 精度
+  final BigInt lockRaw;  // 锁定 Quote 最小单位
+  final String effPrice; // 实际价格（1/rate）
+  const _BuyCalc(this.rateStr, this.lockRaw, this.effPrice);
 }

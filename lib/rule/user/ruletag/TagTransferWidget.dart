@@ -2,23 +2,15 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-// 【修复，重要】按你刚上传的真实 TagRuleWidget.dart 自己的 import 深度反推：
-// 它比 DeveloperRuleWidget.dart 所在的 rule/user/ 深一层，是放在 rule/user/
-// 下一个独立的子文件夹里（这里先假设叫 ruletag/，和 QccUserRulePage.dart
-// 那边的假设保持一致）。TagTransferWidget.dart 是标签功能的另一半，理应
-// 和 TagRuleWidget.dart 放同一个子文件夹，所以这里的相对路径统一比之前
-// （按扁平目录写的版本）多加一层 `../`。
+import 'package:qcc_flutter/home/QccQueryService.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
 import '../../../home/QccExplorerService.dart';
 import '../../../procotol/QccPacket.dart';
-// 【修复，重要】改用协议层真正实现了 toSign()/toBytes() 的 RuleData，不再
-// 用 QccRuleBaseObj.dart 里的 QccRuleData——该类整体不再使用。
 import '../../../procotol/RuleData.dart';
 import '../../../qccwallet/AddressTool.dart';
 import '../../../qccwallet/QccActiveWallet.dart';
 import '../../../qccwallet/QccWallet.dart';
-// 【修复，重要】原来直接调 QccDataProtocol.encodeTransaction，内部签名逻辑
-// 被注释掉（signature 恒为 ""）——这正是"Invalid Signature"被拒的原因。
-// 改成统一走 SignUtil（和多签两个页面昨天已经改过的方式一致）。
 import '../../../qccwallet/SignUtil.dart';
 import '../../../utile/LogObj.dart';
 import '../../../utile/QccObj.dart';
@@ -27,17 +19,13 @@ import '../../../utile/Tools.dart';
 import '../../../views/setting/AppTranslator.dart';
 import '../../../views/setting/QccPassDialog.dart';
 import '../../../views/toolviews/QccLoading.dart';
-import '../../QccRuleBaseObj.dart';
 import '../UserRuleFileStorage.dart';
 import 'QccUserRuleExtras.dart';
+import 'TagQueryService.dart';
 import 'TagTransferSuccessPage.dart';
 
-/// 【新增】标签资产转让 (TagTransfer) —— 对齐 Java 端
-/// qcc.client.userrule.TxTagTransferTest：把自己名下的标签名称资产整体
-/// 转让给另一个地址（push式转移，受让人不需要自己签名）。服务端只认
-/// rd.from(签名者) == 当前 tag owner，所以这里在提交前提供一个"验证归属"
-/// 按钮，先确认发起地址确实是这个 tagName 的当前 owner，避免提交一笔
-/// 必定被拒的交易。
+/// 标签资产转让 (TagTransfer) —— 对齐 Java qcc.testNetwork.userrule.TxTagTransferTest。
+/// push 式转移：只认签名者 from == 当前 tag owner，newOwner 不需要签名。
 class TagTransferWidget extends StatefulWidget {
   const TagTransferWidget({super.key});
 
@@ -52,13 +40,61 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
   final _tagController = TextEditingController();
   final _newOwnerController = TextEditingController();
 
-  static const String _tagQueryUrl = "https://tx.qccio.com/v1/tag/";
+  // 持有账户可选（原来固定 QccObj.activeWallet，和 TagRuleWidget 不一致）
+  Map<String, String> _walletNames = {};
+  List<String> _localAddrs = [];
+  String nowaddress = "";
 
   _OwnershipCheck _ownership = _OwnershipCheck.idle;
-  // 【新增】"查询失败"时带出服务端给的具体原因（比如"查询失败: 节点无
-  // 响应"），和 TagRuleWidget 里的同款修复保持一致。
   String? _queryErrorMessage;
   bool _isSubmitting = false;
+
+  double? _ruleGasQcc;
+  bool _isLoadingGas = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialLoad();
+    _loadRuleGas();
+  }
+
+  Future<void> _initialLoad() async {
+    final names = await QccStorage.getAllWalletNames();
+    final addrs = QccObj.readWallets().map((e) => e.address).toSet().toList();
+    if (!mounted) return;
+    setState(() {
+      _walletNames = names;
+      _localAddrs = addrs;
+      if (addrs.isNotEmpty) {
+        final active = QccObj.activeWallet?.address;
+        nowaddress = (active != null && addrs.contains(active)) ? active : addrs.first;
+      }
+    });
+  }
+
+  Future<void> _loadRuleGas() async {
+    setState(() => _isLoadingGas = true);
+    try {
+      final q = await QccQueryService.gasQuoteOverview();
+      if (mounted) setState(() => _ruleGasQcc = q.ruleGasQcc);
+    } catch (_) {
+    } finally {
+      if (mounted) setState(() => _isLoadingGas = false);
+    }
+  }
+
+  String _fmtQcc(double v) {
+    var s = v.toStringAsFixed(6);
+    if (s.contains('.')) {
+      s = s.replaceFirst(RegExp(r'0+$'), '');
+      if (s.endsWith('.')) s = s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
+  String _shortAddr(String addr) =>
+      addr.length > 16 ? "${addr.substring(0, 8)}...${addr.substring(addr.length - 6)}" : addr;
 
   @override
   void dispose() {
@@ -69,7 +105,15 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
 
   @override
   Widget build(BuildContext context) {
-    String currentAddress = QccObj.activeWallet?.address ?? Tools.getTra("未选择钱包");
+    if (_localAddrs.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 60),
+        child: Center(
+          child: Text("本机未导入任何钱包，无法转让标签。",
+              style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
+        ),
+      );
+    }
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20.0),
@@ -82,7 +126,9 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
             const SizedBox(height: 24),
 
             _buildLabel("当前持有账户 (From)"),
-            _buildAccountInfoCard(currentAddress),
+            _buildAddressPicker(),
+            const SizedBox(height: 12),
+            _buildAccountInfoCard(nowaddress),
             const SizedBox(height: 24),
 
             _buildLabel("待转让的标签名称 (Tag Name)"),
@@ -119,8 +165,7 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                     child: _ownership == _OwnershipCheck.checking
-                        ? const SizedBox(
-                        width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                         : Trans("验证归属"),
                   ),
                 ),
@@ -145,7 +190,7 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
                 if (!AddressTool.isValidTransferAddressFormat(val.trim())) {
                   return Tools.getTra("地址格式不正确");
                 }
-                if (val.trim() == (QccObj.activeWallet?.address ?? "")) {
+                if (val.trim() == nowaddress) {
                   return Tools.getTra("不能转让给自己");
                 }
                 return null;
@@ -153,7 +198,9 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
             ),
             const SizedBox(height: 16),
             _buildWarningNote(),
-            const SizedBox(height: 32),
+            const SizedBox(height: 16),
+            _buildGasCard(),
+            const SizedBox(height: 16),
 
             _buildActionButtons(),
           ],
@@ -170,7 +217,7 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
         const SizedBox(height: 8),
         Trans(
           "将您名下已注册的标签名称资产整体转让给另一个地址。转让为单向操作，"
-              "受让方不需要签名确认——提交成功后，标签的全部归属权益立即转移，"
+              "受让方不需要签名确认——上链后，标签的全部归属权益立即转移，"
               "原地址将不再拥有该标签的任何权限。",
           style: const TextStyle(color: Colors.grey, fontSize: 13, height: 1.4),
         ),
@@ -185,7 +232,43 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
     );
   }
 
+  Widget _buildAddressPicker() {
+    return DropdownButtonFormField<String>(
+      value: nowaddress.isEmpty ? null : nowaddress,
+      isExpanded: true,
+      items: _localAddrs
+          .map((a) => DropdownMenuItem(
+                value: a,
+                child: Text(
+                  _walletNames[a] != null ? "${_walletNames[a]} ($a)" : a,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ))
+          .toList(),
+      onChanged: _isSubmitting
+          ? null
+          : (val) {
+              if (val != null) {
+                setState(() {
+                  nowaddress = val;
+                  // 换了持有账户，之前的归属验证结果不再有效
+                  _ownership = _OwnershipCheck.idle;
+                  _queryErrorMessage = null;
+                });
+              }
+            },
+      decoration: InputDecoration(
+        filled: true,
+        fillColor: Colors.grey.shade50,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+      ),
+    );
+  }
+
   Widget _buildAccountInfoCard(String address) {
+    final String? nick = _walletNames[address];
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -205,8 +288,16 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (nick != null && nick.isNotEmpty)
+                  Text(nick,
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black87),
+                      overflow: TextOverflow.ellipsis),
                 Text(address,
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.bold),
+                    style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        fontWeight: nick != null && nick.isNotEmpty ? FontWeight.normal : FontWeight.bold,
+                        color: nick != null && nick.isNotEmpty ? Colors.grey[600] : Colors.black),
                     overflow: TextOverflow.ellipsis),
                 const SizedBox(height: 6),
                 Row(
@@ -228,14 +319,14 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
       return _hintCard(Icons.check_circle, Colors.green, "已确认您是该标签的当前持有者，可以发起转让");
     }
     if (_ownership == _OwnershipCheck.notOwner) {
-      return _hintCard(Icons.error_outline, Colors.redAccent, "当前钱包不是该标签的持有者，提交转让必定被拒");
+      return _hintCard(Icons.error_outline, Colors.redAccent, "当前账户不是该标签的持有者，提交转让必定被拒");
     }
     if (_ownership == _OwnershipCheck.notFound) {
       return _hintCard(Icons.help_outline, Colors.redAccent, "查无此标签，请确认名称是否输入正确");
     }
     if (_ownership == _OwnershipCheck.error) {
       final String reason =
-      (_queryErrorMessage != null && _queryErrorMessage!.isNotEmpty) ? "：$_queryErrorMessage" : "";
+          (_queryErrorMessage != null && _queryErrorMessage!.isNotEmpty) ? "：$_queryErrorMessage" : "";
       return _hintCard(Icons.help_outline, Colors.grey, "查询失败$reason，建议先重试验证归属再提交");
     }
     return const SizedBox.shrink();
@@ -280,6 +371,44 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
     );
   }
 
+  Widget _buildGasCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.2)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.local_gas_station_outlined, size: 18, color: Colors.orange),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              _ruleGasQcc != null
+                  ? "转让手续费 ${_fmtQcc(_ruleGasQcc!)} QCC，由当前持有账户扣除"
+                  : (_isLoadingGas ? "正在查询链上手续费…" : "手续费查询失败，以链上实际扣除为准"),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: _ruleGasQcc != null ? FontWeight.bold : FontWeight.normal,
+                color: _ruleGasQcc != null ? Colors.deepOrange : Colors.grey,
+              ),
+            ),
+          ),
+          if (_ruleGasQcc == null && !_isLoadingGas)
+            IconButton(
+              iconSize: 18,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              icon: const Icon(Icons.refresh, color: Colors.deepOrange),
+              onPressed: _loadRuleGas,
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildActionButtons() {
     return SizedBox(
       width: double.infinity,
@@ -299,61 +428,49 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
     );
   }
 
-  Future<void> _checkOwnership() async {
+  Future<TagInfo?> _checkOwnership() async {
     final String tagName = _tagController.text.trim();
-    if (tagName.isEmpty) return;
+    if (tagName.isEmpty) return null;
     setState(() => _ownership = _OwnershipCheck.checking);
-    try {
-      final response =
-      await http.get(Uri.parse("$_tagQueryUrl$tagName")).timeout(const Duration(seconds: 15));
-      // 【修复，重要】和 TagRuleWidget._checkAvailability() 同一个问题——
-      // 不能只靠 HTTP 状态码判断成功/失败，实测下来节点异常时 body 里也会
-      // 带 200 之外的状态但 JSON 结构完好，统一用 body 里的 "ok" 字段判断：
-      //   ok:true  + found:true  → 查到归属，比对是否是当前钱包
-      //   ok:true  + found:false → 查无此标签
-      //   ok:false               → 真正的查询失败(节点异常等)，原样带出
-      //                            服务端给的 message，不能当成"查无此标签"
-      final dynamic data = jsonDecode(response.body);
-      final bool ok = data is Map && data['ok'] == true;
-      if (ok) {
-        LogObj.log("TagTransfer 归属验证成功: ${response.body}");
-        final bool found = data['found'] == true;
-        if (!found) {
-          if (mounted) setState(() => _ownership = _OwnershipCheck.notFound);
-          return;
-        }
-        final Map? tagInfo = data['data'] is Map ? data['data'] as Map : null;
-        final String? ownerVal = tagInfo?['owner']?.toString();
-        final bool isOwner = ownerVal != null && ownerVal == QccObj.activeWallet?.address;
-        if (mounted) {
-          setState(() => _ownership = isOwner ? _OwnershipCheck.verified : _OwnershipCheck.notOwner);
-        }
+    final info = await TagQueryService.query(tagName);
+    if (!mounted) return info;
+    setState(() {
+      if (!info.ok) {
+        _ownership = _OwnershipCheck.error;
+        _queryErrorMessage = info.error;
+      } else if (!info.found) {
+        _ownership = _OwnershipCheck.notFound;
       } else {
-        LogObj.log("TagTransfer 归属验证失败: ${response.body}");
-        final String? msg = (data is Map) ? data['message']?.toString() : null;
-        if (mounted) {
-          setState(() {
-            _ownership = _OwnershipCheck.error;
-            _queryErrorMessage = msg;
-          });
-        }
+        // 原来比对的是 QccObj.activeWallet，现在比对选中的持有账户
+        _ownership = info.owner == nowaddress ? _OwnershipCheck.verified : _OwnershipCheck.notOwner;
       }
-    } catch (e) {
-      LogObj.log("TagTransfer 归属验证异常: $e");
-      if (mounted) {
-        setState(() {
-          _ownership = _OwnershipCheck.error;
-          _queryErrorMessage = null;
-        });
-      }
-    }
+    });
+    return info;
   }
 
   Future<void> _handleTransfer() async {
     if (!_formKey.currentState!.validate()) return;
-    if (QccObj.activeWallet == null) {
-      Tools.showToast(context, "请先激活钱包");
+    if (nowaddress.isEmpty) {
+      Tools.showToast(context, "请选择持有账户");
       return;
+    }
+    final String from = nowaddress;
+    final String tagName = _tagController.text.trim();
+    final String newOwner = _newOwnerController.text.trim();
+
+    // 提交前强制验证归属：查无此标签 / 不是持有者 → 必定被拒，不签名不扣费。
+    // 查询失败不拦截，交给公链裁定。
+    final pre = await _checkOwnership();
+    if (!mounted) return;
+    if (pre != null && pre.ok) {
+      if (!pre.found) {
+        Tools.showToast(context, "查无此标签，无法转让");
+        return;
+      }
+      if (pre.owner != from) {
+        Tools.showToast(context, "当前账户不是该标签的持有者");
+        return;
+      }
     }
 
     String? password = await QccPassDialog.show(context);
@@ -362,45 +479,42 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
     final statusNotifier = ValueNotifier<TxStep>(TxStep.restoring);
     QccLoading.show(context, statusNotifier);
 
-    try {
-      setState(() => _isSubmitting = true);
+    bool loadingOpen = true;
+    void closeLoading() {
+      if (loadingOpen && mounted && Navigator.canPop(context)) Navigator.pop(context);
+      loadingOpen = false;
+    }
 
-      // 1. 还原私钥
+    setState(() => _isSubmitting = true);
+    try {
       statusNotifier.value = TxStep.restoring;
-      QccWallet? wallet = await QccStorage.restoreWallet(context, QccObj.activeWallet!.address, password);
-      if (wallet == null || wallet.address != QccObj.activeWallet!.address) {
+      QccWallet? wallet = await QccStorage.restoreWallet(context, from, password);
+      if (wallet == null || wallet.address != from || wallet.privateKey == null) {
         throw Exception("钱包恢复错误，请检查密码");
       }
-      if (wallet.privateKey == null) throw "支付密码错误";
 
-      // 2. 构建转让对象——服务端只认签名地址(from)==当前 owner，newOwner
-      // 不需要自己签名（push式转移）
+      // 对齐 Java buildTagTransferData()：transferJson {tagName, newOwner}
       statusNotifier.value = TxStep.building;
-      final tagTransfer = QccTagTransfer(
-        tagName: _tagController.text.trim(),
-        newOwner: _newOwnerController.text.trim(),
-      );
+      final tagTransfer = QccTagTransfer(tagName: tagName, newOwner: newOwner);
 
-      // 3. 构建公链规则容器——RuleData() 构造函数已自动填好 timestamp/chain。
       final ruleData = RuleData();
-      ruleData.from = QccObj.activeWallet!.address;
+      ruleData.assetId = "QCCRule"; // Java 显式设置，原 Flutter 没设；须在 finalizeId() 前
+      ruleData.from = from;
       ruleData.ruleType = "UserRule";
       ruleData.ruleName = "TagTransfer";
       ruleData.ruleJson = jsonEncode(tagTransfer.toJson());
       ruleData.ruleAppendJson = "";
       ruleData.finalizeId();
 
-      // 4. 执行签名——统一走 SignUtil.signAndEncode()
       statusNotifier.value = TxStep.signing;
       final QccPacket packet = await SignUtil.instance.signAndEncode(
-        from: QccObj.activeWallet!.address,
+        from: from,
         toSignString: ruleData.toSign(),
         payloadJson: jsonEncode(ruleData.toJson()),
         privateKeyHex: wallet.privateKey!,
         publicKeyHex: wallet.pubkey!,
       );
 
-      // 5. 广播
       statusNotifier.value = TxStep.submitting;
       final response = await http.post(
         Uri.parse("${QccExplorerService.baseUrl}/v1/rule"),
@@ -408,41 +522,78 @@ class _TagTransferWidgetState extends State<TagTransferWidget> {
         body: jsonEncode(packet.toJson()),
       );
 
-      if (Navigator.canPop(context)) Navigator.pop(context);
+      closeLoading();
       LogObj.log("标签转让返回参数${response.body}");
-      if (response.statusCode == 200) {
-        final resData = jsonDecode(response.body);
-        if (resData['status'] == 'ACCEPTED' || resData['status'] == 'success') {
-          if (resData['data'] != null) {
-            try {
-              var inner = jsonDecode(resData['data']);
-              resData['ruleName'] = inner['ruleName'] ?? "TagTransfer";
-            } catch (e) {
-              LogObj.log("解析标签转让详情失败: $e");
-              resData['ruleName'] = "TagTransfer";
+      if (response.statusCode != 200) throw "网络通讯失败: ${response.statusCode}";
+
+      final dynamic decoded = jsonDecode(response.body);
+      if (decoded is! Map) throw "返回格式异常: ${response.body}";
+      final Map<String, dynamic> resData = Map<String, dynamic>.from(decoded);
+
+      final String code = (resData['code'] ?? resData['status'] ?? '').toString().toUpperCase();
+      final String txHash = (resData['txHash'] ?? '').toString();
+      if (code != 'ACCEPTED' || txHash.isEmpty) {
+        throw resData['msg'] ?? "转让被拒绝（请确认您仍是该标签的当前持有者）";
+      }
+
+      resData['ruleName'] = "TagTransfer";
+      resData['id'] = txHash;
+      resData['from'] = from;
+      resData['ruleJson'] = ruleData.ruleJson;
+      resData['chainStatus'] = 'pending';
+      if (_ruleGasQcc != null) resData['gas'] = _ruleGasQcc;
+
+      await UserRuleFileStorage.saveRuleTask(resData);
+      if (!mounted) return;
+
+      final TxChainStatus? st = await showDialog<TxChainStatus?>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => QccTxConfirmDialog(
+          txHash: txHash,
+          confirmedTitle: "标签转让已上链",
+          details: [
+            Text("标签：$tagName", style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text("转出：${_walletNames[from] ?? ''} ${_shortAddr(from)}", style: const TextStyle(fontSize: 12)),
+            Text("受让：${_walletNames[newOwner] ?? ''} ${_shortAddr(newOwner)}", style: const TextStyle(fontSize: 12)),
+            if (_ruleGasQcc != null) Text("手续费：${_fmtQcc(_ruleGasQcc!)} QCC"),
+          ],
+          footer: "上链后将在详情页按标签复核新的链上归属。",
+          onFinal: (s) async {
+            await UserRuleFileStorage.saveRuleTask({
+              ...resData,
+              'chainStatus': s.state.name,
+              if (s.blockHeight != null) 'blockHeight': s.blockHeight,
+              if (s.message != null) 'chainMsg': s.message,
+            });
+            if (s.state == TxChainState.confirmed) {
+              await SignUtil.instance.markSubmitted(wallet.address);
             }
-          } else {
-            resData['ruleName'] = "TagTransfer";
-          }
-          // 【新增】标记该地址已成功提交过交易，供 SignUtil 复用公钥登记状态。
-          await SignUtil.instance.markSubmitted(wallet.address);
-          await UserRuleFileStorage.saveRuleTask(resData);
-          if (mounted) {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (context) => TagTransferSuccessPage(ruleData: resData)),
-            );
-          }
-        } else {
-          throw resData['msg'] ?? "转让被拒绝（请确认您仍是该标签的当前持有者）";
-        }
+          },
+        ),
+      );
+
+      if (!mounted) return;
+      if (st?.state == TxChainState.confirmed) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) => TagTransferSuccessPage(ruleData: {
+              ...resData,
+              'chainStatus': 'confirmed',
+              if (st!.blockHeight != null) 'blockHeight': st.blockHeight,
+            }),
+          ),
+        );
+      } else if (st?.state == TxChainState.failed) {
+        Tools.showToast(context, "标签转让上链失败：${st!.message ?? '未知原因'}", isError: true);
       } else {
-        throw "网络通讯失败: ${response.statusCode}";
+        Tools.showToast(context, "转让已受理，尚未确认上链，请稍后在规则状态中查看");
       }
     } catch (e) {
-      if (Navigator.canPop(context)) Navigator.pop(context);
+      closeLoading();
       LogObj.log("标签转让异常: $e");
-      Tools.showToast(context, "转让失败: $e");
+      if (mounted) Tools.showToast(context, "转让失败: $e", isError: true);
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }

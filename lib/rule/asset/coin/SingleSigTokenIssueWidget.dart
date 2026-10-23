@@ -1,7 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:developer' as LogObj;
-import 'dart:math';
 import 'package:flutter/foundation.dart';
+// 原来是 import 'dart:developer' as LogObj —— 名字一样，但日志进的是
+// DevTools，不进工程自己的 LogObj，真机上看不到。换成工程的 LogObj。
+import 'package:qcc_flutter/utile/LogObj.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:qcc_flutter/rule/asset/AssetIssueSuccessPage.dart';
@@ -29,7 +33,7 @@ import '../../../views/setting/QccPassDialog.dart';
 import '../../../views/toolviews/QccLoading.dart';
 import '../AssetFileStorage.dart';
 import '../core/AssetMeta.dart';
-
+import 'AssetIdSecurity.dart';
 class SingleSigTokenIssueWidget extends StatefulWidget {
   const SingleSigTokenIssueWidget({super.key});
 
@@ -62,10 +66,41 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
   bool _isAssetIdAvailable = true;
   bool _isCheckingAsset = false;
 
+  // 查重防抖 + 序号：原来每敲一个字就拉一次 /v1/asset 全量列表，且响应
+  // 乱序时，旧输入的结果可能覆盖新输入的结果（显示"可用"其实已被占用）。
+  Timer? _checkDebounce;
+  int _checkSeq = 0;
+
   @override
   void initState() {
     super.initState();
     _loadWallets();
+  }
+
+  @override
+  void dispose() {
+    _checkDebounce?.cancel();
+    _idController.dispose();
+    _supplyController.dispose();
+    _precisionController.dispose();
+    super.dispose();
+  }
+
+  void _onAssetIdChanged(String v) {
+    _checkDebounce?.cancel();
+    final id = v.trim();
+    // 格式不合法就不去查重：查也没意义，链上反正会拒
+    if (AssetIdSecurity.explain(id) != null) {
+      _checkSeq++; // 作废在途的查重请求
+      if (_isCheckingAsset || !_isAssetIdAvailable) {
+        setState(() {
+          _isCheckingAsset = false;
+          _isAssetIdAvailable = true;
+        });
+      }
+      return;
+    }
+    _checkDebounce = Timer(const Duration(milliseconds: 400), () => _checkAssetId(id));
   }
 
   Future<void> _loadWallets() async {
@@ -87,25 +122,29 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
 
   /// 资产 ID 查重：和多签稳定币发行走同一个 GET /v1/asset 接口，本地按
   /// assetId 大小写不敏感过滤已注册资产列表。
-  Future<void> _checkAssetId(String assetId) async {
+  /// 返回 true 表示可用。提交前也会再调一次，以提交瞬间的结果为准。
+  Future<bool> _checkAssetId(String assetId) async {
+    final int seq = ++_checkSeq;
     if (assetId.isEmpty) {
-      setState(() => _isAssetIdAvailable = true);
-      return;
+      if (mounted) setState(() => _isAssetIdAvailable = true);
+      return true;
     }
-    setState(() => _isCheckingAsset = true);
+    if (mounted) setState(() => _isCheckingAsset = true);
     try {
       final response = await http.get(Uri.parse("${QccExplorerService.baseUrl}/v1/asset"));
       if (response.statusCode == 200) {
         final res = jsonDecode(response.body);
         List assets = jsonDecode(res['data']);
         bool exists = assets.any((a) => a['assetId'].toString().toUpperCase() == assetId.toUpperCase());
-        setState(() => _isAssetIdAvailable = !exists);
+        if (mounted && seq == _checkSeq) setState(() => _isAssetIdAvailable = !exists);
+        return !exists;
       }
     } catch (e) {
       LogObj.log("资产查重失败: $e");
     } finally {
-      if (mounted) setState(() => _isCheckingAsset = false);
+      if (mounted && seq == _checkSeq) setState(() => _isCheckingAsset = false);
     }
+    return _isAssetIdAvailable; // 查询失败时沿用上次结果，由链上做最终判定
   }
 
   @override
@@ -156,14 +195,18 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
     );
   }
 
-  void _handleSubmit(String addr) {
+  Future<void> _handleSubmit(String addr) async {
     if (!_formKey.currentState!.validate()) return;
 
     if (addr.isEmpty) {
       Tools.showToast(context, "请先选择发行地址");
       return;
     }
-    if (!_isAssetIdAvailable) {
+    // 提交瞬间再查一次：防抖期间直接点提交，或输入后别人刚注册了同名资产
+    _checkDebounce?.cancel();
+    final bool available = await _checkAssetId(_idController.text.trim());
+    if (!mounted) return;
+    if (!available) {
       Tools.showToast(context, "该资产代码已被注册，请更换");
       return;
     }
@@ -187,7 +230,9 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
         Tools.showToast(context, "发行总量超过公链最大数值限制");
         return;
       }
-      _processIssue(p, addr);
+      // 把已校验过的 BigInt 结果直接传下去，不再在 _processIssue 里用
+      // pow() 重新算一遍（两处算法不同，迟早不一致）。
+      _processIssue(p, addr, totalInitialSupply.toInt());
     } catch (e) {
       Tools.showToast(context, "发行总量格式错误");
     }
@@ -198,7 +243,7 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
   // 可选了，必须按用户实际选中的 issuerAddr 去还原对应的私钥，否则会出现
   // "选了地址A，签名却用了活跃钱包B的私钥"这种地址错配（同
   // QccCreateMultiSigPage.dart 已修过的同类问题）。
-  Future<void> _processIssue(int precision, String issuerAddr) async {
+  Future<void> _processIssue(int precision, String issuerAddr, int initialSupplyRaw) async {
     setState(() => _isSubmitting = true);
     String? password = await QccPassDialog.show(context);
     if (password == null) {
@@ -208,6 +253,14 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
 
     final statusNotifier = ValueNotifier<TxStep>(TxStep.restoring);
     QccLoading.show(context, statusNotifier);
+
+    // 原写法：成功路径先 pop 了 loading，之后被拒/非 200 时 throw，catch 里
+    // 再 pop 一次，弹出的是当前页面。用标志位保证 loading 只关一次。
+    bool loadingOpen = true;
+    void closeLoading() {
+      if (loadingOpen && mounted && Navigator.canPop(context)) Navigator.pop(context);
+      loadingOpen = false;
+    }
 
     try {
       // 1. 还原私钥
@@ -226,8 +279,7 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
       meta.burnable = _burnable;
       meta.type="COIN";
       // 2. 初始供应量换算 (int 对应 Java long)
-      int supplyCount = int.parse(_supplyController.text);
-      meta.initialSupply = (supplyCount * pow(10, precision)).toInt();
+      meta.initialSupply = initialSupplyRaw;
       LogObj.log("资产发行meta配置${meta.toJson()}");
       // 3. 构建 RuleData 容器——RuleData() 构造函数已自动填好 timestamp/chain。
       RuleData rule = RuleData();
@@ -253,41 +305,93 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
         privateKeyHex: wallet.privateKey!,
         publicKeyHex: wallet.pubkey!,
       );
-      String url="https://tx.qccio.com/v1/rule";
-      var response = await http.post(
-        Uri.parse(url),
+      // 原来写死 https://tx.qccio.com，和查重用的 baseUrl 不是同一个节点；
+      // 切测试网/主网时发行会发错网。统一走 QccExplorerService.baseUrl。
+      final response = await http.post(
+        Uri.parse("${QccExplorerService.baseUrl}/v1/rule"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode(packet.toJson()),
       );
-      if (Navigator.canPop(context)) Navigator.pop(context);
+      closeLoading();
       LogObj.log("资产发行返回json ${response.body}");
-      if (response.statusCode == 200) {
-        final resData = jsonDecode(response.body);
-        if (resData['status'] == 'ACCEPTED' || resData['status'] == 'success') {
-          // 注入 ruleName 方便本地存储识别
-          resData['ruleName'] = AssetType.AssetMeta.name;
-          // 【新增】标记该地址已成功提交过交易，供 SignUtil 复用公钥登记状态。
-          await SignUtil.instance.markSubmitted(wallet.address);
-          // 6. 存入本地记录
-          await AssetFileStorage.saveAsset(resData);
-          Tools.showToast(context, "✅ 资产发行规则已广播成功");
-          // 7. 跳转至结果页
-          if (mounted) {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (context) => AssetIssueSuccessPage(ruleData: resData)),
-            );
-          }
-        } else {
-          throw resData['msg'] ?? "公链拒绝了该资产发布";
-        }
-      } else {
+      if (response.statusCode != 200) {
         throw "网络通讯异常: ${response.statusCode}";
       }
+
+      final dynamic decoded = jsonDecode(response.body);
+      if (decoded is! Map) throw "返回格式异常: ${response.body}";
+      final Map<String, dynamic> resData = Map<String, dynamic>.from(decoded);
+
+      // 返回：{"status":"accepted","code":"ACCEPTED","txHash":..,"msg":..}
+      // 原来判断 status=='ACCEPTED'||'success'，对小写 accepted 永远不成立，
+      // 已受理被当成失败，用户重发就会重复发行同一资产（第二笔会因重名失败，
+      // 但手续费照扣）。以 code 为准。
+      final String code = (resData['code'] ?? resData['status'] ?? '').toString().toUpperCase();
+      final String txHash = (resData['txHash'] ?? '').toString();
+      if (code != 'ACCEPTED' || txHash.isEmpty) {
+        throw resData['msg'] ?? "公链拒绝了该资产发布";
+      }
+
+      resData['ruleName'] = AssetType.AssetMeta.name;
+      resData['id'] = txHash; // 兼容旧格式 data.id
+      resData['from'] = wallet.address;
+      resData['assetId'] = _idController.text.trim();
+      resData['ruleJson'] = rule.ruleJson;
+      resData['chainStatus'] = 'pending';
+
+      // 先落本地记录（受理 ≠ 上链）
+      await AssetFileStorage.saveAsset(resData);
+
+      if (!mounted) return;
+      final TxChainStatus? st = await showDialog<TxChainStatus?>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => QccTxConfirmDialog(
+          txHash: txHash,
+          confirmedTitle: "资产发行已上链",
+          details: [
+            Text("资产代码：${_idController.text.trim()}"),
+            Text("发行总量：${_supplyController.text}（精度 $precision）"),
+            Text("增发 ${_mintable ? '允许' : '禁止'} · 冻结 ${_freezable ? '允许' : '禁止'} · 销毁 ${_burnable ? '允许' : '禁止'}",
+                style: const TextStyle(fontSize: 12, color: Colors.black54)),
+          ],
+          footer: "资产上链前不可转账或增发。",
+          onFinal: (s) async {
+            await AssetFileStorage.saveAsset({
+              ...resData,
+              'chainStatus': s.state.name,
+              if (s.blockHeight != null) 'blockHeight': s.blockHeight,
+              if (s.message != null) 'chainMsg': s.message,
+            });
+            // 公钥登记以上链为准，理由同商户规则
+            if (s.state == TxChainState.confirmed) {
+              await SignUtil.instance.markSubmitted(wallet.address);
+            }
+          },
+        ),
+      );
+
+      if (!mounted) return;
+      if (st?.state == TxChainState.confirmed) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) => AssetIssueSuccessPage(ruleData: {
+              ...resData,
+              'chainStatus': 'confirmed',
+              if (st!.blockHeight != null) 'blockHeight': st.blockHeight,
+            }),
+          ),
+        );
+      } else if (st?.state == TxChainState.failed) {
+        Tools.showToast(context, "资产发行上链失败：${st!.message ?? '未知原因'}", isError: true);
+      } else {
+        Tools.showToast(context, "资产发行已受理，尚未确认上链，请稍后在资产记录中查看");
+      }
     } catch (e) {
-      if (Navigator.canPop(context)) Navigator.pop(context);
-      LogObj.log("发布资产错误$e,返回错误内容");
-      Tools.showToast(context, "发布失败: $e");
+      closeLoading();
+      LogObj.log("发布资产错误$e");
+      if (mounted) Tools.showToast(context, "发布失败: $e", isError: true);
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
@@ -409,7 +513,7 @@ class _SingleSigTokenIssueWidgetState extends State<SingleSigTokenIssueWidget> {
       child: TextFormField(
         controller: _idController,
         textCapitalization: TextCapitalization.characters,
-        onChanged: _checkAssetId,
+        onChanged: _onAssetIdChanged,
         decoration: InputDecoration(
           labelText: Tools.getTra("资产代码 (assetId)"),
           hintText: "如: QCC_USDT",

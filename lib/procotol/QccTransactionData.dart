@@ -147,6 +147,7 @@ class QccTransactionData {
   /// 对应 Java finalizeId()：SHA3-256(getPayloadForHash()) 的十六进制小写字符串
   String finalizeId() {
     fromdev="QQxDj4tZrVA77PA3U1wW91kcmMigkcj5HN";
+    chain="6666";
     timestamp = DateTime.now().millisecondsSinceEpoch;
     memo ??= "";
     final bytes = utf8.encode(getPayloadForHash());

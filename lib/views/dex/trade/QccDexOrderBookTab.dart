@@ -175,6 +175,12 @@ class _QccDexOrderBookTabState extends State<QccDexOrderBookTab> {
         MaterialPageRoute(
           builder: (context) => QccWinTransactionPage(initialHash: targetHash),
         )
-    );
+    ).then((_) {
+      // 从 Win 页返回后立即用本地扣减重算盘口，不必等下一次手动下拉刷新
+      if (mounted) {
+        QccDexEngine().processRawOrders(QccOpenDataManager.getOrdersByType(QccMatchType.dex));
+        setState(() {});
+      }
+    });
   }
 }

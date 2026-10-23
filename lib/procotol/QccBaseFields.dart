@@ -137,7 +137,7 @@ String readHash(ByteReader r) {
 
 /// 对应 QccBaseData 的公共字段集合，供各子类复用。
 class QccBaseFields {
-  String chain = '';
+  String chain = '6666';
   String type = '';
   String id = '';
   String? assetId;

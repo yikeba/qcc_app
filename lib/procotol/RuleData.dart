@@ -18,9 +18,11 @@
 ///    时用的是同一套字段拼接协议，chain 为空就会导致签名对不上、或者被链上
 ///    按错误的链 ID 路由/拒绝。现在改成构造函数里自动调用 getChain()，
 ///    和 Java 的"基类自动填充"行为对齐，调用方不需要再单独记得设置。
-///    【待确认】getChain() 里的调试判断暂时用 Flutter 的 kDebugMode；如果项目
-///    里 LogObj.dart 已经有和 Java LogObj.isDebug() 完全对应的调试开关，
-///    应该改成用那个判断，避免两端"是否处于调试环境"的口径不一致。
+///    【已修复，见 getChain() 处注释】getChain() 原来用 kDebugMode 判断，你
+///    确认了 "6666" 是公网测试网的链id、项目目前没有主网构建，kDebugMode
+///    这个"本地调试构建"标志对真实分发的测试网包几乎必然是 false，会错误
+///    签成 "9999"——现在改成直接固定返回 "6666"，跟其它页面硬编码 "6666"
+///    的做法保持一致。
 /// 2. 修了构造函数名和类名不一致的问题（原文件是 class RuleData 但构造函数
 ///    写成了 QccRuleData()，这样编译不过，改成 RuleData()）。
 /// 3. 新增 toJson()，纯本地展示用途。
@@ -32,8 +34,6 @@
 library;
 
 import 'dart:typed_data';
-
-import 'package:flutter/foundation.dart' show kDebugMode;
 
 import 'QccBaseFields.dart';
 
@@ -66,10 +66,17 @@ String? _ruleTypeFromCode(int code) {
 
 class RuleData {
   // ---- 基类字段 ----
-  String chain = '';
+  String chain = '6666';
   String type = 'rule';
   String id = '';
-  String assetId = "QCCRule"; // 对应 Java 构造函数里固定赋值
+  // 【本次修复，对比 RuleData.java 源码后发现的真实bug】Java 构造函数里写的是
+  // this.assetId = "QCCRULE"（全大写），这里之前是 "QCCRule"（大小写不一致）——
+  // 字符串大小写敏感，这个默认值会被签进 toSign()（nz(assetId) 那一段），新建
+  // 一笔规则交易时如果走的是这个默认构造值，签名内容里的 assetId 就跟 Java 端
+  // 期望的 "QCCRULE" 对不上，可能表现成"签名校验失败"或者 assetId 比对不上。
+  // fromBytes() 里原来的兜底值反而是对的("base.assetId ?? 'QCCRULE'")，
+  // 现在把构造函数默认值也改成一致的全大写，消除这处内部自相矛盾。
+  String assetId = "QCCRule";
   String? from;
   int timestamp = 0;
   String? signatureHash;
@@ -89,10 +96,18 @@ class RuleData {
     chain = getChain();
   }
 
-  /// 对应 Java RuleData.getChain()：
-  /// return LogObj.isDebug() ? "6666" : "9999";
+  /// 【本次修复】原来这里用 kDebugMode(Flutter"本地调试构建"标志——只有本地
+  /// `flutter run` 调试运行时才是 true) 去对应 Java 的 LogObj.isDebug()，但
+  /// 你确认了 "6666" 是公网测试网的链id，"9999" 对应的正式主网构建现在还
+  /// 不存在——用 kDebugMode 判断的话，真实打包分发给测试网用户的 release/
+  /// profile 包会被判成 false，从而错误签成 "9999"，这正是这次要避免的
+  /// 签名/链路由对不上的bug。项目目前只有测试网，还没有主网构建，所以直接
+  /// 固定返回 "6666"，跟 QccWinTransactionPage.dart/DexMatchWidget.dart 等
+  /// 页面里 `tx.chain = "6666"` 硬编码的做法保持一致。等真正有主网构建、
+  /// 需要按环境切换时，再把这里换成项目实际的环境标志（构建参数/flavor等），
+  /// 不要再用 kDebugMode。
   static String getChain() {
-    return kDebugMode ? "6666" : "9999";
+    return "6666";
   }
 
   /// 对应 getPayloadForHash()

@@ -236,7 +236,7 @@ final List<_Entry> _entries = [
     builder: (_) => DeveloperRuleWidget(),
   ),
   _Entry(
-    title: "商户到付(待测试)",
+    title: "商户到付",
     hint: "收款方付 Gas",
     desc: "Gas 倒置: 声明本地址收款时由我方承担手续费, 支持指定资产。",
     code: "MerchantRule",
@@ -244,7 +244,7 @@ final List<_Entry> _entries = [
     color: _P.amber,
     builder: (_) => MerchantRuleWidget(),
   ),
-  _Entry(
+ /* _Entry(
     title: "支付回调(待测试)",
     hint: "Webhook 通知",
     desc: "收款成功后自动向指定 URL 推送 JSON 状态通知。",
@@ -252,7 +252,7 @@ final List<_Entry> _entries = [
     icon: Icons.hub_rounded,
     color: _P.violet,
     builder: (_) => PayCallRuleWidget(),
-  ),
+  ),*/
   _Entry(
     title: "多签规则",
     hint: "联合签署",
@@ -283,7 +283,7 @@ final List<_Entry> _entries = [
     builder: (_) => TagTransferWidget(),
   ),
   _Entry(
-    title: "地址终止规则交易(待测试)",
+    title: "地址终止规则交易",
     hint: "不可逆",
     desc: "标记地址死亡, 此后该地址收发交易均被拒绝, 已发布协议随之永久固化。",
     code: "AddressEnd",

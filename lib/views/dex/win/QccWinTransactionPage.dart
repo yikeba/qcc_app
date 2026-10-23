@@ -1,17 +1,14 @@
 import 'dart:async'; // ✅ 引入 async 以支持 TimeoutException
 import 'dart:convert';
-import 'dart:developer' as LogObj;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:qcc_flutter/qccwallet/QccActiveWallet.dart';
+import 'package:qcc_flutter/utile/LogObj.dart';
 import 'package:qcc_flutter/utile/QccObj.dart';
 import 'package:qcc_flutter/views/myasset/QccAssetService.dart';
-// 【本次修正，对应你的要求"签名方式"，和 DexMatchWidget.dart 那次是同一个
-// bug 模式】原来手写 compute(_signTransactionTask,...) ->
-// QccDataProtocol.encodeTransaction()——后者内部真正的签名调用整段被注释掉，
-// 固定 signature:""，之前这个 Win(碰撞)交易提交的签名字段自始至终是空字符串。
-// 现在改用 QccTxFlow.run()，内部走 SignUtil.instance.signAndEncode()。
 import '../../../procotol/QccTxFlow.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
 import '../../../procotol/QccTransactionData.dart';
 import '../../../utile/QccStorage.dart';
 import '../../../utile/Tools.dart';
@@ -634,19 +631,26 @@ class _QccWinTransactionPageState extends State<QccWinTransactionPage> {
         builtTx = tx;
         return QccSignPayload(toSign: tx.toSign(), payloadJson: jsonEncode(tx.toJson()));
       },
-      submitUrl: "https://tx.qccio.com/v1/txm",
+      // 原来写死 https://tx.qccio.com，统一走 baseUrl
+      submitUrl: "${QccExplorerService.baseUrl}/v1/txm",
     );
 
     if (!mounted) return;
     LogObj.log("现货win交易数据返回：${result.data}");
     if (result.cancelled) return;
 
-    if (result.success) {
-      final resJson = result.data!;
+    final String? winTxHash = _acceptedTxHash(result);
+    if (winTxHash != null && builtTx != null) {
+      final Map<String, dynamic> resJson = Map<String, dynamic>.from(result.data ?? {});
       final tx = builtTx!;
 
-      // ✅ 极简做法：直接记一笔本地账
-      QccOpenDataManager.addLocalDeduction(openHash, buyQty);
+      // 🐛 本地扣减必须与盘口缓存同单位：缓存里是 openhash 的 currentAmount
+      // （挂单锁定资产 sellAsset 的链上最小单位），原来传的是界面数量 buyQty，
+      // QCC 下差了 10^9 倍，扣减几乎不生效。
+      // 释放时机跟随这笔 Win 自己的链上结果，不再固定 10 秒。
+      final double deductRaw =
+      QccAssetService().getAmountRaw(sellAsset, buyQty.toStringAsFixed(8)).toDouble();
+      QccOpenDataManager.addLocalDeduction(openHash, deductRaw, winTxHash: winTxHash);
       // ✅ 核心：构建 Win 订单快照并保存
       final winOrderSnapshot = {
         'id': tx.id, // 这笔 Win 交易的 Hash
@@ -666,11 +670,58 @@ class _QccWinTransactionPageState extends State<QccWinTransactionPage> {
 
       await QccStorage.addWinOrder(tx.from!, winOrderSnapshot);
       LogObj.log("✅ Win 订单已保存至本地历史");
+      if (!mounted) return;
 
-      if (mounted) QccWinSuccessSheet.show(context, jsonEncode(resJson));
+      final TxChainStatus? st = await showDialog<TxChainStatus?>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => QccTxConfirmDialog(
+          txHash: winTxHash,
+          confirmedTitle: "成交已上链",
+          details: [
+            Text("获得：${buyQty.toStringAsFixed(8)} $sellAsset", style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text("支付：${_payEstimated.toStringAsFixed(8)} $buyAssetId", style: const TextStyle(fontSize: 12)),
+            Text("对手挂单：${openHash.length > 12 ? '${openHash.substring(0, 6)}...${openHash.substring(openHash.length - 6)}' : openHash}",
+                style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.black54)),
+          ],
+          footer: "上链前资产尚未完成交割；若上链失败，本次支付不会扣除。",
+        ),
+      );
+      if (!mounted) return;
+
+      if (st?.state == TxChainState.confirmed) {
+        showModalBottomSheet(
+          context: context,
+          isScrollControlled: true,
+          isDismissible: false,
+          backgroundColor: Colors.transparent,
+          builder: (_) => QccWinSuccessSheet(responseData: {
+            ...resJson,
+            'txHash': winTxHash,
+            'data': jsonEncode(tx.toJson()), // 新响应不含 data，用本地交易补上
+            'chainStatus': 'confirmed',
+          }),
+        );
+        _fetchOrderData(openHash); // 刷新挂单剩余量
+      } else if (st?.state == TxChainState.failed) {
+        Tools.showToast(context, "成交上链失败：${st!.message ?? '未知原因'}，本次支付未扣除");
+        _fetchOrderData(openHash);
+      } else {
+        Tools.showToast(context, "成交已受理，尚未确认上链，请稍后在「我的交易」中查看");
+      }
     } else {
       LogObj.log("Win 交易出错: ${result.error}");
       Tools.showToast(context, "操作失败: ${result.error}");
     }
+  }
+
+  /// 同 DexMatchWidget._acceptedTxHash：以 code 为准兜底判断受理。
+  static String? _acceptedTxHash(dynamic result) {
+    final Map? d = result.data is Map ? result.data as Map : null;
+    if (d == null) return null;
+    final code = (d['code'] ?? d['status'] ?? '').toString().toUpperCase();
+    final h = d['txHash']?.toString() ?? '';
+    if ((result.success == true || code == 'ACCEPTED') && h.isNotEmpty) return h;
+    return null;
   }
 }

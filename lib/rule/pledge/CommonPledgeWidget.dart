@@ -9,6 +9,9 @@ import 'package:qcc_flutter/utile/QccStorage.dart';
 import 'package:qcc_flutter/utile/Tools.dart';
 import 'package:qcc_flutter/utile/LogObj.dart';
 import 'package:qcc_flutter/views/setting/AppTranslator.dart';
+import 'package:qcc_flutter/home/QccExplorerService.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
 
 import '../../procotol/PledgeRules.dart';
 import '../../procotol/PledgetType.dart';
@@ -78,15 +81,18 @@ class _CommonPledgeWidgetState extends State<CommonPledgeWidget> {
   Future<void> _loadMyLockRecords() async {
     if (nowaddress.isEmpty) return;
     final all = await PledgeFileStorage.getTasksForAddress(nowaddress);
-    // 只列"普通质押(protocol=='')、还没标记解押、和当前 assetId 一致"的
+    // 只列"普通质押(protocol=='')、已上链锁定(LOCKED)、和当前 assetId 一致"的
     // lock 记录，供解押时选择。
+    // 状态流转：PENDING(受理) → LOCKED(上链) / FAILED；解押：LOCKED → UNLOCKING → UNLOCKED
+    // PENDING / FAILED / UNLOCKING 都不可再解押（未上链的质押解押必被拒；
+    // UNLOCKING 已在途，再提交一次会重复）。旧记录无此状态体系时 status 为 'LOCKED'。
     final assetId = _assetIdController.text.trim();
     final matched = all
         .where((t) =>
     (t['protocol'] ?? '') == '' &&
         (t['actionType'] ?? '') == PledgeActionType.lock &&
         (t['assetId'] ?? '') == assetId &&
-        (t['status'] ?? '') != 'UNLOCKED')
+        (t['status'] ?? 'LOCKED') == 'LOCKED')
         .toList();
     if (!mounted) return;
     setState(() {
@@ -119,6 +125,11 @@ class _CommonPledgeWidgetState extends State<CommonPledgeWidget> {
 
     setState(() => _isSubmitting = true);
 
+    final bool isLock = _isLock; // 提交过程中锁定，避免中途切换 Tab
+    final String from = nowaddress;
+    final String? credentialHash = _selectedCredentialHash;
+    String? builtRuleId; // 本地 finalizeId() 结果，QccTxFlow 误判失败时作 txHash 兜底
+
     final result = await QccTxFlow.run(
       context: context,
       address: nowaddress,
@@ -141,10 +152,12 @@ class _CommonPledgeWidgetState extends State<CommonPledgeWidget> {
         rule.ruleJson = jsonEncode(pledge.toJson());
         rule.ruleAppendJson = "";
         rule.finalizeId();
+        builtRuleId = rule.id;
         LogObj.log("质押提交整个json：${rule.toJson()}");
         return QccSignPayload(toSign: rule.toSign(), payloadJson: jsonEncode(rule.toJson()));
       },
-      submitUrl: "https://tx.qccio.com/v1/rule",
+      // 原来写死 https://tx.qccio.com，统一走 baseUrl
+      submitUrl: "${QccExplorerService.baseUrl}/v1/rule",
     );
 
     if (!mounted) return;
@@ -152,30 +165,86 @@ class _CommonPledgeWidgetState extends State<CommonPledgeWidget> {
 
     if (result.cancelled) return;
 
-    if (result.success) {
-      final txHash = result.data?['txHash']?.toString() ?? "";
-      if (_isLock) {
-        await PledgeFileStorage.saveTask({
-          'txHash': txHash,
-          'address': nowaddress,
-          'assetId': assetId,
-          'amount': amount, // 存的是换算后的最小单位，跟提交给链上的值保持一致
-          'protocol': PledgetType.plain,
-          'actionType': PledgeActionType.lock,
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
-          'status': 'LOCKED',
-        });
-        Tools.showToast(context, "✅ 普通质押已提交，txHash 已自动记录，解押时可直接选择");
-      } else {
-        await PledgeFileStorage.updateStatus(_selectedCredentialHash!, 'UNLOCKED');
-        Tools.showToast(context, "✅ 解押已提交");
-      }
-      _amountController.clear();
-      _loadMyLockRecords();
-    } else {
+    final String? txHash = _acceptedTxHash(result, builtRuleId);
+    if (txHash == null) {
       LogObj.log("普通质押提交异常: ${result.error}");
       Tools.showToast(context, "错误: ${result.error}");
+      return;
     }
+
+    // ---- 受理：先落本地状态（受理 ≠ 上链） ----
+    // lock 的 txHash 就是将来解押要用的 credentialHash，受理当下就必须存下来；
+    // 原来只在 result.success 时存，而 QccTxFlow 把受理误判为失败，
+    // 导致 lock 已上链、本机却没有记录，从界面上再也无法解押。
+    if (isLock) {
+      await PledgeFileStorage.saveTask({
+        'txHash': txHash,
+        'address': from,
+        'assetId': assetId,
+        'amount': amount, // 换算后的最小单位，与链上一致
+        'protocol': PledgetType.plain,
+        'actionType': PledgeActionType.lock,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+        'status': 'PENDING',
+      });
+    } else {
+      // 解押在途：从可解押列表移除，防止重复提交；上链失败再恢复为 LOCKED
+      await PledgeFileStorage.updateStatus(credentialHash!, 'UNLOCKING');
+    }
+    _amountController.clear();
+    _loadMyLockRecords();
+    if (!mounted) return;
+
+    final String humanAmount = server.QccAssetService().getHumanAmount(assetId, amount.toString());
+    final TxChainStatus? st = await showDialog<TxChainStatus?>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => QccTxConfirmDialog(
+        txHash: txHash,
+        confirmedTitle: isLock ? "质押已上链" : "解押已上链",
+        details: [
+          Text("${isLock ? '质押' : '解押'}：$humanAmount $assetId", style: const TextStyle(fontWeight: FontWeight.bold)),
+          Text("地址：${_walletNames[from] ?? ''} ${_shortHash(from)}", style: const TextStyle(fontSize: 12)),
+          if (!isLock) Text("原质押：${_shortHash(credentialHash!)}", style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+        ],
+        footer: isLock ? "上链后资产才被锁定；txHash 已自动记录，解押时可直接选择。" : "上链后资产才会退回到质押地址。",
+        onFinal: (s) async {
+          final bool ok = s.state == TxChainState.confirmed;
+          if (isLock) {
+            await PledgeFileStorage.updateStatus(txHash, ok ? 'LOCKED' : 'FAILED');
+          } else {
+            await PledgeFileStorage.updateStatus(credentialHash!, ok ? 'UNLOCKED' : 'LOCKED');
+          }
+          if (mounted) _loadMyLockRecords();
+        },
+      ),
+    );
+    if (!mounted) return;
+
+    if (st?.state == TxChainState.confirmed) {
+      Tools.showToast(context, isLock ? "✅ 质押已上链，资产已锁定" : "✅ 解押已上链，资产已退回");
+    } else if (st?.state == TxChainState.failed) {
+      Tools.showToast(context,
+          isLock ? "质押上链失败：${st!.message ?? '未知原因'}，资产未被锁定" : "解押上链失败：${st!.message ?? '未知原因'}，质押仍有效");
+    } else {
+      Tools.showToast(context, "交易已受理，尚未确认上链，请稍后在「我的记录」中查看");
+    }
+  }
+
+  /// 从 QccTxFlow 结果取出已受理的 txHash（与 DexMatchWidget 同一兜底）。
+  /// 【临时兜底，根治在 QccTxFlow】QccTxFlow 把受理响应判成失败、data 为空，
+  /// 服务端 msg 落在 error 里："Transaction accepted, query by txHash for final result"。
+  /// 此时用本地 finalizeId() 的 rule.id 作为 txHash（日志里 id 与 toSign 末段一致）。
+  static String? _acceptedTxHash(dynamic result, String? localId) {
+    final Map? d = result.data is Map ? result.data as Map : null;
+    if (d != null) {
+      final code = (d['code'] ?? d['status'] ?? '').toString().toUpperCase();
+      final h = d['txHash']?.toString() ?? '';
+      if ((result.success == true || code == 'ACCEPTED') && h.isNotEmpty) return h;
+    }
+    final String err = (result.error ?? '').toString().toLowerCase();
+    if (err.contains('transaction accepted') && localId != null && localId.isNotEmpty) return localId;
+    return null;
   }
 
   @override
@@ -303,13 +372,10 @@ class _CommonPledgeWidgetState extends State<CommonPledgeWidget> {
       items: _myLockRecords
           .map((r) => DropdownMenuItem(
         value: r['txHash']?.toString(),
-        // ⚠️ TODO：r['amount'] 存的是最小单位原始整数，这里直接显示会跟输入框
-        // 现在改成的"按 QCC 展示"不一致。QccAssetService 里如果有对应的
-        // "最小单位 → 展示值"反向换算方法（getAmountRaw 的反函数），麻烦告诉我
-        // 具体方法名，我把这里也换算成 QCC 展示；我手头没有 QccAssetService.dart
-        // 源码，不敢瞎猜方法名。
+        // r['amount'] 是最小单位，用 getHumanAmount 换算展示（质押管理页、DEX 页已在用）
         child: Text(
-          "金额 ${r['amount']} (最小单位) · ${_shortHash(r['txHash']?.toString() ?? '')}",
+          "${server.QccAssetService().getHumanAmount((r['assetId'] ?? 'QCC').toString(), r['amount'].toString())} "
+              "${r['assetId'] ?? ''} · ${_shortHash(r['txHash']?.toString() ?? '')}",
           style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
         ),
       ))

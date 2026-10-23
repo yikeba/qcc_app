@@ -5,13 +5,14 @@ import 'package:qcc_flutter/qccnodemap/qcc_geo_service.dart';
 import 'QccNodeManager.dart';
 import '../views/setting/AppTranslator.dart';
 import 'QccNodeMapWidget.dart';
-/// 列表筛选模式，对应服务端 API 的两种查询语义：
-/// - all    → GET /v1/node            （全量，含历史离线节点）
-/// - active → GET /v1/node?active=true（仅活跃节点）
-///
-/// 这个筛选是"列表"和"地图"两个 tab 共用的——切全部/活跃时，地图上的点
-/// 也会跟着变，两个 tab 看的是同一份已过滤数据，只是换了个展示方式。
-enum _NodeFilter { all, active }
+import 'QccProducerClusterWidget.dart';
+
+/// 列表/地图共用的筛选：
+/// - all  全部节点，按 当前出块 / 同步 / 未识别 分段显示
+/// - sync 只看同步节点
+/// 任何时刻只有一个生产者（当前出块者），不单设"生产"筛选。
+/// "仅在线"是叠加开关（reachable && active）。
+enum _NodeFilter { all, sync }
 
 class QccNodeListWidget extends StatefulWidget {
   const QccNodeListWidget({super.key});
@@ -24,13 +25,18 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
     with SingleTickerProviderStateMixin {
   bool _loading = true;
   _NodeFilter _filter = _NodeFilter.all;
+  bool _onlineOnly = false;
   final Map<String, GeoInfo?> _geoByIp = {};
   late final TabController _tabController;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
+    // 切到"生产集群"tab 时隐藏顶部的节点筛选区，需要随 tab 切换重建
+    _tabController.addListener(() {
+      if (!_tabController.indexIsChanging && mounted) setState(() {});
+    });
     _refresh();
   }
 
@@ -43,25 +49,18 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
   Future<void> _refresh() async {
     setState(() => _loading = true);
     await QccNodeManager.instance.init();
-    // 【修复】这里以前刷新完还会自己再 await 一次 probeAll()，但
-    // refreshNodes() 内部本来就会做一轮探测——两次探测撞在一起时，
-    // 后面这次会被 QccNodeManager 的重入保护直接短路、瞬间返回（并
-    // 没有真的等到探测结果），导致这里提前认为"刷新完了"，实际探测
-    // 结果还没落地就把 loading 关掉、把旧数据渲染出去了，多刷新几次
-    // 之后"X/Y 在线"的统计和列表里实际显示的节点就会对不上。现在
-    // QccNodeManager.refreshNodes() 已经会老老实实等探测完成再返回，
-    // 这里不需要也不应该再重复探测一次。
+    // refreshNodes() 内部已经会 await 一轮探测 + 视图合并，这里不要再重复探测。
     await QccNodeManager.instance.refreshNodes(force: true);
+    // 积分来自 /v1/producer，和生产集群 tab 共用缓存；失败不影响节点列表
+    try {
+      await QccProducerService.fetch();
+    } catch (_) {}
 
-    // 并发查地理位置，避免 N 个节点串行等待
-    // 用去掉方括号后的地址做 key，和下面 build() 里取值时保持一致，
-    // 避免 "[::1]" 与 "::1" 被当成两个不同的 key。
-    // 注意这里用全量 nodes（含本地隐藏的），不只是 visibleNodes——
-    // 隐藏的节点如果之后自动恢复显示，地理位置缓存已经提前准备好了；
-    // 地图 tab 用的经纬度也是从这份缓存里取，不需要单独再查一次。
+    // 只查还没查过的 IP（GeoService 自己也有缓存，这里省掉无谓的 Future）
     final nodes = QccNodeManager.instance.nodes;
     await Future.wait(nodes.map((n) async {
       final key = IpUtils.stripBrackets(n.ip);
+      if (_geoByIp.containsKey(key) && _geoByIp[key] != null) return;
       _geoByIp[key] = await GeoService.lookup(n.ip);
     }));
 
@@ -105,8 +104,6 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
     showModalBottomSheet(
       context: context,
       builder: (ctx) {
-        // 用 StatefulBuilder 让面板里"恢复"之后能立刻刷新自己，
-        // 不用等外层 setState 触发的重建。
         return StatefulBuilder(
           builder: (ctx, setSheetState) {
             final hidden = QccNodeManager.instance.hiddenNodes;
@@ -136,8 +133,19 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
                             final n = hidden[i];
                             return ListTile(
                               contentPadding: EdgeInsets.zero,
-                              title: Text(IpUtils.displayIp(n.ip)),
-                              subtitle: Text("高度 ${n.height}"),
+                              title: Row(
+                                children: [
+                                  QccNodeRoleBadge(node: n),
+                                  Expanded(
+                                    child: Text(IpUtils.displayIp(n.ip),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis),
+                                  ),
+                                ],
+                              ),
+                              subtitle: Text(n.nodeId.isEmpty
+                                  ? "高度 ${n.height}"
+                                  : "${shortNodeId(n.nodeId)} · 高度 ${n.height}"),
                               trailing: TextButton(
                                 onPressed: () async {
                                   await _unhideNode(n);
@@ -159,79 +167,126 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
     );
   }
 
+  /// 离线 → 灰；网络在线但本机连不上 → 蓝灰（不是故障，只是本机路由不通）；
+  /// 可直连 → 按延迟绿/橙/红。
   Color _latencyColor(QccNode n) {
-    if (!n.reachable) return Colors.grey;
+    if (!n.isOnline) return Colors.grey;
+    if (!n.isDirect) return Colors.blueGrey;
     if (n.latencyMs < 150) return Colors.green;
     if (n.latencyMs < 400) return Colors.orange;
     return Colors.red;
   }
 
-  /// 按当前选中的筛选模式过滤 + 排序节点，对应服务端 API 的两种视图：
-  ///
-  /// - 全部（对应不带参数的 GET /v1/node）：不过滤，排序保持原来的规则——
-  ///   在线（reachable && active）排前面，离线排后面；同为在线时按延迟从
-  ///   低到高排；延迟也相同（或同为离线）时按原始顺序，不然 List.sort
-  ///   不保证稳定，离线节点之间会在每次刷新时顺序乱跳。
-  ///
-  /// - 活跃（对应 GET /v1/node?active=true）：只保留 active == true 的
-  ///   节点。但光看 active 不够——active 是节点自己上报、来自 /v1/qccnode
-  ///   返回的"最近有心跳"状态，是它对自己的判断，可能过时或者跟本地探测
-  ///   结果对不上（比如节点自己觉得在线，但客户端这边实际连不通；节点刚
-  ///   启动时，各节点看到的即时状态本来也会有几秒的不一致）。本地已经对
-  ///   每个节点做过真实探测（probeAll → reachable/latencyMs），这份判断
-  ///   更可信，所以活跃 tab 额外叠加 reachable 条件：本地探测显示离线的
-  ///   节点，即使自称 active，也不算进"活跃"里。
-  ///   这里直接用本地已缓存的数据过滤，不需要额外再发一次带参数的请求。
-  ///   活跃列表按 height 从高到低排——height 越高（区块越新）排越前面；
-  ///   height 相同时按延迟从低到高；最后按原始顺序兜底，保证稳定排序。
-  List<QccNode> _filterAndSort(List<QccNode> nodes, _NodeFilter filter) {
-    final base = filter == _NodeFilter.active
-        ? nodes.where((n) => n.active && n.reachable).toList()
-        : nodes;
+  static int _kindRank(QccNode n) =>
+      n.isProducer ? 0 : (n.isSync ? 1 : 2);
 
-    final indexed = base.asMap().entries.toList();
+  /// 过滤 + 排序：
+  /// 类型（生产 → 同步 → 未识别）→ 当前出块者置顶 → 在线优先 → 高度降序
+  /// → 延迟升序 → 原始顺序兜底（List.sort 不稳定，避免刷新时顺序乱跳）。
+  List<QccNode> _filterAndSort(List<QccNode> nodes) {
+    Iterable<QccNode> base = nodes;
+    if (_filter == _NodeFilter.sync) {
+      base = base.where((n) => n.isSync);
+    }
+    if (_onlineOnly) base = base.where((n) => n.isOnline);
+
+    final indexed = base.toList().asMap().entries.toList();
     indexed.sort((a, b) {
-      if (filter == _NodeFilter.active) {
-        final heightCmp = b.value.height.compareTo(a.value.height); // 高度越高越靠前
-        if (heightCmp != 0) return heightCmp;
-        final latencyCmp = a.value.latencyMs.compareTo(b.value.latencyMs);
-        if (latencyCmp != 0) return latencyCmp;
-        return a.key.compareTo(b.key);
-      } else {
-        final aOnline = a.value.reachable && a.value.active;
-        final bOnline = b.value.reachable && b.value.active;
-        if (aOnline != bOnline) return aOnline ? -1 : 1;
-        final latencyCmp = a.value.latencyMs.compareTo(b.value.latencyMs);
-        if (latencyCmp != 0) return latencyCmp;
-        return a.key.compareTo(b.key);
-      }
+      final x = a.value, y = b.value;
+      var c = _kindRank(x).compareTo(_kindRank(y));
+      if (c != 0) return c;
+      if (x.isNowProducer != y.isNowProducer) return x.isNowProducer ? -1 : 1;
+      if (x.isOnline != y.isOnline) return x.isOnline ? -1 : 1;
+      if (x.isDirect != y.isDirect) return x.isDirect ? -1 : 1;
+      c = y.height.compareTo(x.height);
+      if (c != 0) return c;
+      c = x.latencyMs.compareTo(y.latencyMs);
+      if (c != 0) return c;
+      return a.key.compareTo(b.key);
     });
     return indexed.map((e) => e.value).toList();
   }
 
-  void _copyIp(String ip) {
-    Clipboard.setData(ClipboardData(text: ip));
+  void _copyIp(String ip) => _copyText(ip, "IP");
+
+  void _copyText(String text, String label) {
+    Clipboard.setData(ClipboardData(text: text));
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("已复制：$ip"), duration: const Duration(seconds: 1)),
+      SnackBar(
+          content: Text("已复制$label：$text"),
+          duration: const Duration(seconds: 1)),
+    );
+  }
+
+  /// 积分角标：#名次 积分；生产组 indigo、候选 blueGrey、负分红色
+  Widget _heatChip(QccProducerRank r) {
+    final c = r.heat < 0
+        ? Colors.red.shade600
+        : (r.isProducer ? Colors.indigo : Colors.blueGrey);
+    return Tooltip(
+      message: heatBreakdown(r) == null
+          ? "积分 ${r.heat} · 第 ${r.rank} 名"
+          : "积分 ${r.heat} = ${heatBreakdown(r)} · 第 ${r.rank} 名",
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+        margin: const EdgeInsets.only(right: 6),
+        decoration: BoxDecoration(
+          color: c.withOpacity(0.12),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text("#${r.rank} · ${r.heat}分",
+            style: TextStyle(
+                fontSize: 10, fontWeight: FontWeight.w800, color: c)),
+      ),
+    );
+  }
+
+  Widget _infoChip(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(text,
+          style: TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w600, color: color)),
+    );
+  }
+
+  Widget _statChip(String label, int online, int total, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        "$label $online/$total",
+        style: TextStyle(
+            fontSize: 12, fontWeight: FontWeight.w600, color: color),
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    // allNodes：本地手动隐藏的节点已被排除，用于顶部“X / Y 在线”整体统计
-    // （不随筛选 tab 变化，方便用户随时看到整体网络健康状况）。
-    // nodes：按当前筛选模式过滤 + 排序后的节点——列表 tab 和地图 tab
-    // 共用同一份，切"全部/活跃"时两个 tab 会同步变化。
-    final allNodes = QccNodeManager.instance.visibleNodes;
-    final nodes = _filterAndSort(allNodes, _filter);
-    final onlineCount = allNodes.where((n) => n.reachable && n.active).length;
-    final hiddenCount = QccNodeManager.instance.hiddenNodes.length;
+    final mgr = QccNodeManager.instance;
+    final allNodes = mgr.visibleNodes;
+    final nodes = _filterAndSort(allNodes);
+    final net = mgr.network;
+    final tip = mgr.tipHeight;
+
+    final syncs = allNodes.where((n) => n.isSync).toList();
+    final unknowns = allNodes.where((n) => n.kind == QccNodeKind.unknown).toList();
+    int online(List<QccNode> l) => l.where((n) => n.isOnline).length;
+    final direct = allNodes.where((n) => n.isDirect).length;
+    final hiddenCount = mgr.hiddenNodes.length;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Trans("Qcc 测试网络节点"), // 假设 Trans 是你的翻译组件
+        title: const Trans("Qcc 测试网络节点"),
         actions: [
-          // 刷新按钮挪到 AppBar 上：列表/地图两个 tab 共用，不用各自再放一个。
           IconButton(
             icon: _loading
                 ? const SizedBox(
@@ -251,68 +306,102 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
           tabs: const [
             Tab(icon: Icon(Icons.list_alt), text: "列表"),
             Tab(icon: Icon(Icons.map), text: "地图"),
+            Tab(icon: Icon(Icons.leaderboard), text: "生产集群"),
           ],
         ),
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  "节点状态  $onlineCount / ${allNodes.length} 在线",
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
+          if (_tabController.index != 2)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 网络摘要：高度 + 当前出块者 + 视图一致性
+                  Text(
+                    "网络高度 ${tip > 0 ? tip : '—'}",
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.w600),
                   ),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    // 全部 / 活跃 切换：对应 API 的两种查询语义（见 _filterAndSort 注释）。
-                    // 列表和地图 tab 共用这一个筛选。
-                    SegmentedButton<_NodeFilter>(
-                      segments: const [
-                        ButtonSegment(
-                          value: _NodeFilter.all,
-                          label: Text("全部"),
-                          icon: Icon(Icons.list_alt, size: 16),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Icon(Icons.bolt, size: 14, color: Colors.amber.shade800),
+                      const SizedBox(width: 2),
+                      Expanded(
+                        child: GestureDetector(
+                          onLongPress: net.nowProducerId == null
+                              ? null
+                              : () => _copyText(net.nowProducerId!, "nodeId"),
+                          child: Text(
+                            "当前出块 ${net.nowProducerIp == null ? '—' : IpUtils.displayIp(net.nowProducerIp!)}"
+                                "${net.nowProducerId == null ? '' : ' · ${shortNodeId(net.nowProducerId!)}'}",
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontSize: 12, color: Colors.grey.shade700),
+                          ),
                         ),
-                        ButtonSegment(
-                          value: _NodeFilter.active,
-                          label: Text("活跃"),
-                          icon: Icon(Icons.bolt, size: 16),
-                        ),
-                      ],
-                      selected: {_filter},
-                      showSelectedIcon: false,
-                      onSelectionChanged: (selected) {
-                        setState(() => _filter = selected.first);
-                      },
-                    ),
-                    // 隐藏节点入口：只有存在隐藏节点时才显示，避免界面常驻一个
-                    // 用不上的按钮。点开是一个可以手动"恢复"的列表。
-                    if (hiddenCount > 0)
-                      TextButton.icon(
-                        onPressed: _showHiddenNodesSheet,
-                        icon: const Icon(Icons.visibility_off, size: 16),
-                        label: Text("已隐藏 $hiddenCount"),
                       ),
-                  ],
-                ),
-              ],
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      _statChip("同步在线", online(syncs), syncs.length, Colors.teal),
+                      _statChip("本机可直连", direct, allNodes.length, Colors.indigo),
+                      if (mgr.clientOffline)
+                        _infoChip("本机网络异常", Colors.red)
+                      else if (mgr.clientV6 == QccClientV6.no)
+                        _infoChip("本机无 IPv6", Colors.blueGrey),
+                      if (unknowns.isNotEmpty)
+                        _statChip("未识别", online(unknowns), unknowns.length,
+                            Colors.grey),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      SegmentedButton<_NodeFilter>(
+                        segments: const [
+                          ButtonSegment(value: _NodeFilter.all, label: Text("全部")),
+                          ButtonSegment(value: _NodeFilter.sync, label: Text("同步")),
+                        ],
+                        selected: {_filter},
+                        showSelectedIcon: false,
+                        onSelectionChanged: (s) =>
+                            setState(() => _filter = s.first),
+                      ),
+                      FilterChip(
+                        label: const Text("仅在线"),
+                        selected: _onlineOnly,
+                        onSelected: (v) => setState(() => _onlineOnly = v),
+                      ),
+                      if (hiddenCount > 0)
+                        TextButton.icon(
+                          onPressed: _showHiddenNodesSheet,
+                          icon: const Icon(Icons.visibility_off, size: 16),
+                          label: Text("已隐藏 $hiddenCount"),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
             ),
-          ),
           Expanded(
             child: TabBarView(
               controller: _tabController,
               children: [
                 _buildListTab(nodes),
                 QccNodeMapWidget(nodes: nodes, geoByIp: _geoByIp),
+                const QccProducerClusterWidget(),
               ],
             ),
           ),
@@ -321,186 +410,259 @@ class _QccNodeListWidgetState extends State<QccNodeListWidget>
     );
   }
 
+  /// "全部"筛选下在类型切换处插分段标题；其它筛选只有一种类型，不需要标题。
+  List<Object> _withSectionHeaders(List<QccNode> nodes) {
+    if (_filter != _NodeFilter.all) return nodes;
+    final items = <Object>[];
+    QccNodeKind? last;
+    for (final n in nodes) {
+      if (n.kind != last) {
+        final group = nodes.where((x) => x.kind == n.kind).toList();
+        final on = group.where((x) => x.isOnline).length;
+        final title = switch (n.kind) {
+          QccNodeKind.producer => "当前出块",
+          QccNodeKind.sync => "同步节点",
+          QccNodeKind.unknown => "未识别 / 其他链",
+        };
+        items.add("$title · $on/${group.length} 在线");
+        last = n.kind;
+      }
+      items.add(n);
+    }
+    return items;
+  }
+
   Widget _buildListTab(List<QccNode> nodes) {
+    if (nodes.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _refresh,
+        child: ListView(
+          // 用 ListView 包一层保留下拉刷新手势
+          children: [
+            SizedBox(
+              height: MediaQuery.of(context).size.height * 0.5,
+              child: Center(
+                child: Text(
+                  "暂无符合条件的节点，下拉刷新试试",
+                  style: TextStyle(color: Colors.grey.shade600),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final items = _withSectionHeaders(nodes);
     return RefreshIndicator(
       onRefresh: _refresh,
-      child: nodes.isEmpty
-          ? ListView(
-        // 用 ListView 包一层（而不是直接 Center）是为了保留
-        // 下拉刷新手势——活跃列表暂时为空时，用户仍然可以
-        // 下拉重新探测，不然空状态下 RefreshIndicator 收不到
-        // 手势会显得像是"卡住了"。
-        children: [
-          SizedBox(
-            height: MediaQuery.of(context).size.height * 0.5,
-            child: Center(
-              child: Text(
-                _filter == _NodeFilter.active
-                    ? "暂无活跃节点，下拉刷新试试"
-                    : "暂无节点数据，下拉刷新试试",
-                style: TextStyle(color: Colors.grey.shade600),
-              ),
-            ),
-          ),
-        ],
-      )
-          : ListView.separated(
+      child: ListView.builder(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-        itemCount: nodes.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemCount: items.length,
         itemBuilder: (context, i) {
-          final n = nodes[i];
-          final ipKey = IpUtils.stripBrackets(n.ip);
-          final geo = _geoByIp[ipKey];
-          final isV6 = IpUtils.isIPv6(n.ip);
-          final displayIp = IpUtils.displayIp(n.ip);
-          // 左滑可以本地隐藏这个节点（删掉过期不用的节点，不影响
-          // 后台继续探测——它恢复可达后会自动重新显示，见
-          // QccNodeManager._doProbeAll）。用节点 ip 做 key，
-          // 保证同一个节点在列表重排后依然对应同一个 Dismissible。
-          return Dismissible(
-            key: ValueKey(n.ip),
-            direction: DismissDirection.endToStart,
-            confirmDismiss: (_) => _confirmHide(n),
-            onDismissed: (_) => _hideNode(n),
-            background: Container(
-              alignment: Alignment.centerRight,
-              padding: const EdgeInsets.only(right: 20),
-              decoration: BoxDecoration(
-                color: Colors.red.shade400,
-                borderRadius: BorderRadius.circular(12),
+          final item = items[i];
+          if (item is String) {
+            return Padding(
+              padding: EdgeInsets.fromLTRB(4, i == 0 ? 4 : 14, 4, 6),
+              child: Text(
+                item,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade700,
+                ),
               ),
-              child: const Icon(Icons.visibility_off, color: Colors.white),
-            ),
-            child: Card(
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-                side: BorderSide(color: Colors.grey.shade200),
-              ),
-              child: Padding(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                child: Row(
+            );
+          }
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _buildNodeCard(item as QccNode),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildNodeCard(QccNode n) {
+    final ipKey = IpUtils.stripBrackets(n.ip);
+    final geo = _geoByIp[ipKey];
+    final isV6 = IpUtils.isIPv6(n.ip);
+    final displayIp = IpUtils.displayIp(n.ip);
+    // 在生产者状态机名单里的节点（质押 ≥1 万），显示积分和名次
+    final rank = QccProducerService.rankOf(n.nodeId);
+
+    return Dismissible(
+      key: ValueKey(n.ip),
+      direction: DismissDirection.endToStart,
+      confirmDismiss: (_) => _confirmHide(n),
+      onDismissed: (_) => _hideNode(n),
+      background: Container(
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 20),
+        decoration: BoxDecoration(
+          color: Colors.red.shade400,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Icon(Icons.visibility_off, color: Colors.white),
+      ),
+      child: Card(
+        elevation: 0,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          // 当前出块者用琥珀色描边，一眼找到
+          side: BorderSide(
+            color: n.isNowProducer
+                ? Colors.amber.shade600
+                : Colors.grey.shade200,
+            width: n.isNowProducer ? 1.5 : 1,
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          child: Row(
+            children: [
+              Text(geo?.flag ?? "🏳️", style: const TextStyle(fontSize: 24)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      geo?.flag ?? "🏳️",
-                      style: const TextStyle(fontSize: 24),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              // IPv4 / IPv6 角标：一眼区分节点地址类型
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 5, vertical: 1),
-                                margin: const EdgeInsets.only(right: 6),
-                                decoration: BoxDecoration(
-                                  color: (isV6 ? Colors.blue : Colors.teal)
-                                      .withOpacity(0.12),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  isV6 ? "IPv6" : "IPv4",
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                    color: isV6
-                                        ? Colors.blue.shade700
-                                        : Colors.teal.shade700,
-                                  ),
-                                ),
-                              ),
-                              // IPv6 地址可能很长且没有空格断点，这里单行显示 +
-                              // 省略号，用 Tooltip 展示完整地址、长按复制。
-                              Expanded(
-                                child: Tooltip(
-                                  message: displayIp,
-                                  child: GestureDetector(
-                                    onLongPress: () => _copyIp(displayIp),
-                                    child: Text(
-                                      displayIp,
-                                      maxLines: 1,
-                                      softWrap: false,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w600,
-                                        fontSize: 14,
-                                        fontFeatures: [
-                                          FontFeature.tabularFigures(),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+                    Row(
+                      children: [
+                        QccNodeRoleBadge(node: n),
+                        if (rank != null) _heatChip(rank),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 5, vertical: 1),
+                          margin: const EdgeInsets.only(right: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.blueGrey.withOpacity(0.10),
+                            borderRadius: BorderRadius.circular(4),
                           ),
-                          const SizedBox(height: 2),
-                          RichText(
-                            text: TextSpan(
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: Colors.grey.shade600,
-                              ),
-                              children: [
-                                TextSpan(
-                                    text:
-                                    "${geo?.displayName ?? '定位中...'} · 高度 "),
-                                // 活跃 tab 下，高度是排序依据，加粗突出显示。
-                                TextSpan(
-                                  text: "${n.height}",
-                                  style: _filter == _NodeFilter.active
-                                      ? const TextStyle(
-                                      fontWeight: FontWeight.w700)
-                                      : null,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: _latencyColor(n).withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 6,
-                            height: 6,
-                            decoration: BoxDecoration(
-                              color: _latencyColor(n),
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            n.reachable ? "${n.latencyMs}ms" : "离线",
+                          child: Text(
+                            isV6 ? "IPv6" : "IPv4",
                             style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: _latencyColor(n),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.blueGrey.shade700,
                             ),
                           ),
+                        ),
+                        Expanded(
+                          child: Tooltip(
+                            message: n.nodeId.isEmpty
+                                ? displayIp
+                                : "$displayIp\n${n.nodeId}",
+                            child: GestureDetector(
+                              onLongPress: () => _copyIp(displayIp),
+                              child: Text(
+                                displayIp,
+                                maxLines: 1,
+                                softWrap: false,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 14,
+                                  fontFeatures: [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    RichText(
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      text: TextSpan(
+                        style: TextStyle(
+                            fontSize: 12, color: Colors.grey.shade600),
+                        children: [
+                          TextSpan(
+                              text:
+                              "${geo?.displayName ?? '定位中...'} · 高度 ${n.height < 0 ? '未同步' : n.height}"),
+                          // 同步节点常态落后 1，>2 才标橙提醒
+                          if (n.lag > 0)
+                            TextSpan(
+                              text: " · 落后 ${n.lag}",
+                              style: n.lag > 2
+                                  ? TextStyle(
+                                  color: Colors.orange.shade800,
+                                  fontWeight: FontWeight.w600)
+                                  : null,
+                            ),
                         ],
+                      ),
+                    ),
+                    // nodeId 行：缩写显示，长按复制完整 nodeId。
+                    // IPv6 节点的出口地址（remoteIp）与自报地址不同时一并显示，仅供参考。
+                    if (n.nodeId.isNotEmpty || n.hasAltRemote) ...[
+                      const SizedBox(height: 2),
+                      GestureDetector(
+                        onLongPress: n.nodeId.isEmpty
+                            ? null
+                            : () => _copyText(n.nodeId, "nodeId"),
+                        child: Text(
+                          [
+                            if (n.nodeId.isNotEmpty) shortNodeId(n.nodeId),
+                            if (n.hasAltRemote) "出口 ${n.remoteIp}",
+                          ].join(" · "),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontFamily: 'monospace',
+                            color: Colors.grey.shade500,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Container(
+                padding:
+                const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _latencyColor(n).withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // 实心点 = 本机可直连；空心点 = 网络在线但本机连不上；灰 = 离线
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: (n.isDirect || !n.isOnline)
+                            ? _latencyColor(n)
+                            : Colors.transparent,
+                        border: Border.all(color: _latencyColor(n), width: 1.2),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      n.isDirect
+                          ? "${n.latencyMs}ms"
+                          : (n.isOnline
+                          ? QccNodeManager.instance.unreachableReason(n)
+                          : "离线"),
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: _latencyColor(n),
                       ),
                     ),
                   ],
                 ),
               ),
-            ),
-          );
-        },
+            ],
+          ),
+        ),
       ),
     );
   }

@@ -13,13 +13,21 @@ class QccTxSuccessWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 解析嵌套数据
-    final innerData = jsonDecode(response['data']);
+    // 🐛 新的受理响应只有 {status, code, txHash, msg}，没有 data 字段，
+    // 原来 jsonDecode(response['data']) 会直接抛异常、弹窗崩溃。
+    // 现在由调用方把本地构建的交易放进 data（String 或 Map 均可）。
+    final dynamic rawData = response['data'];
+    final Map<String, dynamic> innerData = rawData is Map
+        ? Map<String, dynamic>.from(rawData)
+        : (rawData is String && rawData.isNotEmpty ? Map<String, dynamic>.from(jsonDecode(rawData)) : <String, dynamic>{});
     final logic = innerData['matchLogic'] ?? {};
     final String rule = logic['rule'] ?? "unknown";
-    final String txHash = response['txHash'];
-    String assetId = innerData['assetId'];
-    double amount = QccAssetService().getHumanAmountNum(assetId, innerData['amount']);
+    final String txHash = (response['txHash'] ?? innerData['id'] ?? "").toString();
+    final String assetId = (innerData['assetId'] ?? "").toString();
+    final double amount =
+    innerData['amount'] == null ? 0 : QccAssetService().getHumanAmountNum(assetId, innerData['amount']);
+    final bool confirmed = response['chainStatus'] == 'confirmed';
+    final dynamic blockHeight = response['blockHeight'];
 
     return Container(
       padding: const EdgeInsets.all(24),
@@ -33,9 +41,13 @@ class QccTxSuccessWidget extends StatelessWidget {
           // 1. 成功动画图标
           const Icon(Icons.check_circle_rounded, color: Colors.green, size: 70),
           const SizedBox(height: 16),
-          const Trans("交易已进入内存池", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Trans(confirmed ? "挂单已上链" : "交易已受理", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
-          const Trans("正在等待节点打包确认...", style: TextStyle(color: Colors.grey, fontSize: 13)),
+          Text(
+              confirmed
+                  ? (blockHeight != null ? "已打包进区块 #$blockHeight，挂单已在盘口生效" : "挂单已在盘口生效")
+                  : "正在等待节点打包确认...",
+              style: const TextStyle(color: Colors.grey, fontSize: 13)),
 
           const Divider(height: 40),
 
@@ -125,7 +137,7 @@ class QccTxSuccessWidget extends StatelessWidget {
               const SizedBox(width: 16),
               Expanded(
                 child: ElevatedButton(
-                  onPressed: () => _openExplorer(innerData["id"]),
+                  onPressed: () => _openExplorer(txHash),
                   style: ElevatedButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 15),
                     backgroundColor: Colors.blue,

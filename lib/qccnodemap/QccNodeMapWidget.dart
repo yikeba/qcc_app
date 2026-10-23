@@ -4,34 +4,100 @@ import 'package:latlong2/latlong.dart' as latlong;
 import 'QccNodeManager.dart';
 import 'qcc_geo_service.dart';
 
-/// 按"城市"把节点聚合成一个点：同一个城市（GeoService 查询给出的经纬度，
-/// 四舍五入到约 11km 精度后落在同一格）无论有多少个节点，地图上只画一个
-/// 标记，标记上直接显示节点数量；点开看这个城市具体有哪些节点、在线情况。
-///
-/// 为什么按城市分组、而不是接一个按屏幕距离动态聚合的 marker cluster 插件：
-/// 一是不用再多引入一个包、多担心版本兼容；二是节点的 GeoIP 定位本来就是
-/// "城市"粒度（不是精确门牌号），同一城市的多个节点本来经纬度就相同，天然
-/// 会落在同一个点上——按城市分组已经能覆盖"未来节点非常多"的场景。如果
-/// 以后同一个城市也堆到几十上百个、觉得气泡数字不够看，可以再引入
-/// flutter_map_marker_cluster 做屏幕距离聚合，跟这里的城市分组不冲突，
-/// 到时候把 MarkerLayer 换成 MarkerClusterLayerWidget 就行。
+/// nodeId 缩写：Qcc 地址 34 位，展示首 6 + 尾 6，完整值靠复制/tooltip。
+String shortNodeId(String id) =>
+    id.length > 16 ? "${id.substring(0, 6)}…${id.substring(id.length - 6)}" : id;
+
+/// 节点角色角标：列表页和地图详情面板共用。
+/// 出块中（当前生产者）> 生产 > 同步 > 未识别。
+class QccNodeRoleBadge extends StatelessWidget {
+  final QccNode node;
+  const QccNodeRoleBadge({super.key, required this.node});
+
+  static Color colorOf(QccNode n) {
+    if (n.foreign) return Colors.deepOrange;
+    if (n.isNowProducer) return Colors.amber.shade800;
+    switch (n.kind) {
+      case QccNodeKind.producer:
+        return Colors.indigo;
+      case QccNodeKind.sync:
+        return Colors.teal;
+      case QccNodeKind.unknown:
+        return Colors.grey;
+    }
+  }
+
+  static String labelOf(QccNode n) {
+    if (n.foreign) return "其他链";
+    if (n.isNowProducer) return "出块中";
+    switch (n.kind) {
+      case QccNodeKind.producer:
+        return "生产";
+      case QccNodeKind.sync:
+        return "同步";
+      case QccNodeKind.unknown:
+        return "未识别";
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = colorOf(node);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      margin: const EdgeInsets.only(right: 6),
+      decoration: BoxDecoration(
+        color: c.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (node.isNowProducer)
+            Padding(
+              padding: const EdgeInsets.only(right: 2),
+              child: Icon(Icons.bolt, size: 11, color: c),
+            ),
+          Text(
+            labelOf(node),
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              color: c,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 按"城市"把节点聚合成一个点（经纬度保留 1 位小数，约 11km 一格）。
+/// 生产/同步区分：
+/// - 格子里有生产者 → 圆角方块；含当前出块者 → 琥珀色粗边框
+/// - 只有同步节点   → 圆形
+/// - 全部离线       → 灰色
+/// 另外按同步节点的 upstreamIps 画"同步节点 → 所挂生产者"的连线，
+/// 直接看出每个生产者带了哪些同步节点、分布在哪。
 class _CityGroup {
-  final String label; // 例如 "Los Angeles, United States"
+  final String label;
   final latlong.LatLng point;
-  final List<QccNode> nodes;
+  final List<QccNode> nodes = [];
 
-  _CityGroup({required this.label, required this.point, required this.nodes});
+  _CityGroup({required this.label, required this.point});
 
-  int get onlineCount => nodes.where((n) => n.reachable && n.active).length;
+  int get onlineCount => nodes.where((n) => n.isOnline).length;
+  int get directCount => nodes.where((n) => n.isOnline && n.isDirect).length;
+  int get producerCount => nodes.where((n) => n.isProducer).length;
+  int get syncCount => nodes.where((n) => n.isSync).length;
+  bool get hasNowProducer => nodes.any((n) => n.isNowProducer);
 }
 
 class QccNodeMapWidget extends StatelessWidget {
-  /// 已经按当前筛选模式（全部/活跃）过滤好的节点列表——地图跟列表看的是
-  /// 同一份数据，切"全部/活跃"时地图上的点也会跟着变。
+  /// 已按当前筛选（全部/生产/同步、仅在线）过滤好的节点列表，跟列表 tab 同一份。
   final List<QccNode> nodes;
 
-  /// 复用 QccNodeListWidget 里已经查好的地理位置缓存（key 是去掉方括号后的
-  /// 地址），避免地图页再对同一批 IP 重新查一次地理位置接口。
+  /// 复用列表页已查好的地理位置缓存（key 是去掉方括号后的地址）。
   final Map<String, GeoInfo?> geoByIp;
 
   const QccNodeMapWidget({
@@ -40,37 +106,30 @@ class QccNodeMapWidget extends StatelessWidget {
     required this.geoByIp,
   });
 
-  List<_CityGroup> _groupByCity() {
-    final Map<String, _CityGroup> groups = {};
-    for (final n in nodes) {
-      final key = IpUtils.stripBrackets(n.ip);
-      final geo = geoByIp[key];
-      if (geo == null || !geo.hasLocation) continue; // 本地网络/还没查到/查询失败，跳过不画
-
-      final point = latlong.LatLng(geo.latitude!, geo.longitude!);
-      // 分组 key：经纬度保留 1 位小数（约 11km），同一城市的节点几乎总会
-      // 落进同一格；理论上两个不同城市可能巧合落进同一格，概率很低，暂不处理。
-      final groupKey =
-          "${geo.latitude!.toStringAsFixed(1)}_${geo.longitude!.toStringAsFixed(1)}";
-
-      final existing = groups[groupKey];
-      if (existing != null) {
-        existing.nodes.add(n);
-      } else {
-        groups[groupKey] =
-            _CityGroup(label: geo.displayName, point: point, nodes: [n]);
-      }
-    }
-    return groups.values.toList();
-  }
-
   @override
   Widget build(BuildContext context) {
-    final groups = _groupByCity();
+    final groups = <String, _CityGroup>{};
+    final groupKeyByIp = <String, String>{};
+
+    for (final n in nodes) {
+      final geo = geoByIp[IpUtils.stripBrackets(n.ip)];
+      if (geo == null || !geo.hasLocation) continue; // 本地网络/没查到，跳过
+      final key =
+          "${geo.latitude!.toStringAsFixed(1)}_${geo.longitude!.toStringAsFixed(1)}";
+      groups
+          .putIfAbsent(
+        key,
+            () => _CityGroup(
+          label: geo.displayName,
+          point: latlong.LatLng(geo.latitude!, geo.longitude!),
+        ),
+      )
+          .nodes
+          .add(n);
+      groupKeyByIp[n.ip] = key;
+    }
 
     if (groups.isEmpty) {
-      // 地理位置查询是异步的（GeoService.lookup），刚打开地图 tab 时经常会
-      // 命中这个空态；提示语指向"稍等/下拉刷新"，别让人以为地图坏了。
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -83,9 +142,14 @@ class QccNodeMapWidget extends StatelessWidget {
       );
     }
 
+    final lines = _buildUpstreamLines(groups, groupKeyByIp);
+    final center = groups.values
+        .firstWhere((g) => g.hasNowProducer, orElse: () => groups.values.first)
+        .point;
+
     return FlutterMap(
       options: MapOptions(
-        initialCenter: groups.first.point,
+        initialCenter: center,
         initialZoom: 2,
         minZoom: 1.5,
         maxZoom: 15,
@@ -93,21 +157,20 @@ class QccNodeMapWidget extends StatelessWidget {
       children: [
         TileLayer(
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-          // OSM 公共瓦片服务的使用政策要求带上能识别应用的 User-Agent，
-          // 换成你们真实的包名（跟 AndroidManifest.xml / Info.plist 里的一致）。
-          // 节点数/用户量大了之后，公共瓦片服务器可能会限流，到时候考虑换成
-          // 付费瓦片服务（Mapbox / MapTiler 等）或自建瓦片服务器。
           userAgentPackageName: 'com.qcc.qcc_flutter',
           maxZoom: 19,
         ),
+        if (lines.isNotEmpty) PolylineLayer(polylines: lines),
         MarkerLayer(
-          markers: groups.map((g) => _buildMarker(context, g)).toList(),
+          markers: groups.values.map((g) => _buildMarker(context, g)).toList(),
         ),
-        // OSM 的瓦片使用政策要求在地图上保留可见的版权归属文字，这个不能删；
-        // 但 RichAttributionWidget 默认还会额外显示 flutter_map 自己的 logo
-        // 图标（跟 OSM 版权无关，纯粹是这个库自己的品牌展示），有些工程的
-        // 资源打包方式下找不到那张图会直接抛 "Unable to load asset" 异常。
-        // 这里显式关掉，只保留真正必须的文字版权。
+        const Align(
+          alignment: Alignment.topLeft,
+          child: Padding(
+            padding: EdgeInsets.all(8),
+            child: _MapLegend(),
+          ),
+        ),
         RichAttributionWidget(
           showFlutterMapAttribution: false,
           attributions: [
@@ -118,10 +181,49 @@ class QccNodeMapWidget extends StatelessWidget {
     );
   }
 
+  /// 同步节点 → 上游生产者 的连线，按城市对去重。
+  /// 两端必须都在当前筛选结果里（比如切到"同步"筛选时生产者不在，就不画线）。
+  /// 跨 180° 经线的连线会走"远的那一边"，节点少时不处理。
+  List<Polyline> _buildUpstreamLines(
+      Map<String, _CityGroup> groups, Map<String, String> groupKeyByIp) {
+    final byIp = {for (final n in nodes) n.ip: n};
+    final drawn = <String, bool>{}; // 城市对 → 是否有在线链路
+    for (final n in nodes) {
+      if (!n.isSync) continue;
+      final from = groupKeyByIp[n.ip];
+      if (from == null) continue;
+      for (final up in n.upstreamIps) {
+        final upNode = byIp[up];
+        final to = groupKeyByIp[up];
+        if (upNode == null || to == null || to == from) continue;
+        final pair = from.compareTo(to) < 0 ? "$from|$to" : "$to|$from";
+        final online = n.isOnline && upNode.isOnline;
+        drawn[pair] = (drawn[pair] ?? false) || online;
+      }
+    }
+    return drawn.entries.map((e) {
+      final ends = e.key.split('|');
+      return Polyline(
+        points: [groups[ends[0]]!.point, groups[ends[1]]!.point],
+        color: e.value
+            ? Colors.indigo.withOpacity(0.5)
+            : Colors.grey.withOpacity(0.35),
+        strokeWidth: 1.6,
+      );
+    }).toList();
+  }
+
   Marker _buildMarker(BuildContext context, _CityGroup g) {
     final hasOnline = g.onlineCount > 0;
-    final color = hasOnline ? Colors.green : Colors.grey;
-    // 节点数超过 2 位数时气泡撑不下，简单截断成 "99+"，避免文字溢出气泡。
+    final isProducerSite = g.producerCount > 0;
+    final Color base = !hasOnline
+        ? Colors.grey
+        : (isProducerSite ? Colors.indigo : Colors.teal);
+    // 网络在线、但这个城市没有一个节点本机能直连（典型：在无 IPv6 的地方看
+    // IPv6 家庭节点）→ 空心标记：节点是活的，只是本机路由不通，不画成离线。
+    final hollow = hasOnline && g.directCount == 0;
+    final Color fill = hollow ? Colors.white : base;
+    final Color textColor = hollow ? base : Colors.white;
     final countText = g.nodes.length > 99 ? "99+" : "${g.nodes.length}";
 
     return Marker(
@@ -132,9 +234,15 @@ class QccNodeMapWidget extends StatelessWidget {
         onTap: () => _showCitySheet(context, g),
         child: Container(
           decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-            border: Border.all(color: Colors.white, width: 2),
+            color: fill,
+            shape: isProducerSite ? BoxShape.rectangle : BoxShape.circle,
+            borderRadius: isProducerSite ? BorderRadius.circular(10) : null,
+            border: Border.all(
+              color: g.hasNowProducer
+                  ? Colors.amber.shade600
+                  : (hollow ? base : Colors.white),
+              width: g.hasNowProducer ? 3 : 2,
+            ),
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withOpacity(0.25),
@@ -146,8 +254,8 @@ class QccNodeMapWidget extends StatelessWidget {
           alignment: Alignment.center,
           child: Text(
             countText,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: textColor,
               fontWeight: FontWeight.w700,
               fontSize: 13,
             ),
@@ -158,6 +266,16 @@ class QccNodeMapWidget extends StatelessWidget {
   }
 
   void _showCitySheet(BuildContext context, _CityGroup g) {
+    // 详情里：当前出块者 → 生产者 → 同步节点；同类在线优先、高度降序
+    int rank(QccNode n) => n.isNowProducer ? 0 : (n.isProducer ? 1 : (n.isSync ? 2 : 3));
+    final sorted = List<QccNode>.from(g.nodes)
+      ..sort((a, b) {
+        final r = rank(a).compareTo(rank(b));
+        if (r != 0) return r;
+        if (a.isOnline != b.isOnline) return a.isOnline ? -1 : 1;
+        return b.height.compareTo(a.height);
+      });
+
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
@@ -172,24 +290,59 @@ class QccNodeMapWidget extends StatelessWidget {
                 style:
                 const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
               ),
+              const SizedBox(height: 2),
+              Text(
+                g.hasNowProducer
+                    ? "含当前出块节点 · 同步 ${g.syncCount}"
+                    : "同步 ${g.syncCount}",
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              ),
               const SizedBox(height: 8),
               Flexible(
                 child: ListView.builder(
                   shrinkWrap: true,
-                  itemCount: g.nodes.length,
+                  itemCount: sorted.length,
                   itemBuilder: (_, i) {
-                    final n = g.nodes[i];
-                    final online = n.reachable && n.active;
+                    final n = sorted[i];
+                    final parts = <String>[];
+                    if (n.nodeId.isNotEmpty) parts.add(shortNodeId(n.nodeId));
+                    parts.add("高度 ${n.height}");
+                    if (n.lag > 0) parts.add("落后 ${n.lag}");
+                    parts.add(n.isDirect
+                        ? "${n.latencyMs}ms"
+                        : (n.isOnline
+                        ? QccNodeManager.instance.unreachableReason(n)
+                        : "离线"));
+                    if (n.hasAltRemote) parts.add("出口 ${n.remoteIp}");
+                    if (n.isSync && n.upstreamIps.isNotEmpty) {
+                      parts.add(
+                          "上游 ${n.upstreamIps.map(IpUtils.displayIp).join(', ')}");
+                    }
                     return ListTile(
                       contentPadding: EdgeInsets.zero,
+                      // 实心绿 = 可直连；空心 = 网络在线但本机连不上；灰 = 离线
                       leading: Icon(
-                        Icons.circle,
+                        n.isOnline && !n.isDirect
+                            ? Icons.circle_outlined
+                            : Icons.circle,
                         size: 10,
-                        color: online ? Colors.green : Colors.grey,
+                        color: !n.isOnline
+                            ? Colors.grey
+                            : (n.isDirect ? Colors.green : Colors.blueGrey),
                       ),
-                      title: Text(IpUtils.displayIp(n.ip)),
-                      subtitle: Text("高度 ${n.height}"
-                          "${n.reachable ? ' · ${n.latencyMs}ms' : ' · 离线'}"),
+                      title: Row(
+                        children: [
+                          QccNodeRoleBadge(node: n),
+                          Expanded(
+                            child: Text(
+                              IpUtils.displayIp(n.ip),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                      subtitle: Text(parts.join(" · ")),
                     );
                   },
                 ),
@@ -197,6 +350,53 @@ class QccNodeMapWidget extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _MapLegend extends StatelessWidget {
+  const _MapLegend();
+
+  Widget _row(Widget icon, String text) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(width: 16, height: 16, child: icon),
+        const SizedBox(width: 6),
+        Text(text, style: const TextStyle(fontSize: 11)),
+      ],
+    ),
+  );
+
+  Widget _shape(Color c, {bool square = false, Color? border}) => Container(
+    decoration: BoxDecoration(
+      color: c,
+      shape: square ? BoxShape.rectangle : BoxShape.circle,
+      borderRadius: square ? BorderRadius.circular(4) : null,
+      border: border == null ? null : Border.all(color: border, width: 2),
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _row(_shape(Colors.indigo, square: true, border: Colors.amber.shade600),
+              "当前出块"),
+          _row(_shape(Colors.teal), "同步节点"),
+          _row(_shape(Colors.white, border: Colors.teal), "在线·本机不可直连"),
+          _row(_shape(Colors.grey), "离线"),
+        ],
       ),
     );
   }

@@ -51,7 +51,7 @@ import 'QccBaseFields.dart';
 
 class EntityData {
   // ---- 基类(QccBaseData)字段 ----
-  String chain = '';
+  String chain = '6666';
   String type = 'entity';
   String id = '';
   String? assetId;

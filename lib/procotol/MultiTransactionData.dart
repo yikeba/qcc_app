@@ -62,7 +62,7 @@ import 'QccBaseFields.dart';
 
 class MultiTransactionData {
   // ---- 基类字段（对应 Java QccBaseData） ----
-  String chain = '';
+  String chain = '6666';
   String type = 'multitransaction';
   String id = '';
   String? assetId;

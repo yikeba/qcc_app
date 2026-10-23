@@ -11,6 +11,7 @@ import 'package:qcc_flutter/utile/QccStorage.dart';
 import 'package:qcc_flutter/utile/Tools.dart';
 import 'package:qcc_flutter/utile/LogObj.dart';
 import 'package:qcc_flutter/views/setting/AppTranslator.dart';
+import 'package:qcc_flutter/txdata/tx/QccTxConfirmService.dart';
 
 import '../../../procotol/PledgeRules.dart';
 import '../../../procotol/PledgetType.dart';
@@ -57,6 +58,8 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
 
   bool _isLock = true;
   bool _isSubmitting = false;
+  // 交易已被节点接收、正在轮询上链确认时显示的进度文字；null 表示不在确认阶段
+  String? _confirmHint;
   bool _isQuerying = false;
   String? _queryResultText;
 
@@ -152,7 +155,15 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
       return;
     }
 
-    setState(() => _isSubmitting = true);
+    setState(() {
+      _isSubmitting = true;
+      _confirmHint = null;
+    });
+
+    // finalizeId() 之后 rule.id 就是 txHash。在这里记下来，不依赖 QccTxFlow
+    // 怎么解读提交响应——新机制下节点只返回"已接收"，QccTxFlow 目前会把它
+    // 当成失败放进 result.error，txHash 就丢了。
+    String localTxHash = "";
 
     final result = await QccTxFlow.run(
       context: context,
@@ -176,6 +187,7 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
         rule.ruleJson = jsonEncode(pledge.toJson());
         rule.ruleAppendJson = "";
         rule.finalizeId();
+        localTxHash = rule.id ?? "";
 
         return QccSignPayload(toSign: rule.toSign(), payloadJson: jsonEncode(rule.toJson()));
       },
@@ -183,29 +195,86 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
     );
 
     if (!mounted) return;
-    setState(() => _isSubmitting = false);
 
-    if (result.cancelled) return;
+    if (result.cancelled) {
+      setState(() => _isSubmitting = false);
+      return;
+    }
 
-    if (result.success) {
-      final txHash = result.data?['txHash']?.toString() ?? "";
-      await PledgeFileStorage.saveTask({
-        'txHash': txHash,
-        'address': nowaddress,
-        'assetId': assetId,
-        'amount': amount, // 存的是换算后的最小单位，跟提交给链上的值保持一致
-        'protocol': PledgetType.superNode,
-        'actionType': _isLock ? PledgeActionType.lock : PledgeActionType.unlock,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'status': _isLock ? 'LOCKED' : 'UNLOCKED',
-      });
-      Tools.showToast(context, _isLock ? "✅ 超级节点质押已提交" : "✅ 解押已提交");
-      _amountController.clear();
-      _loadMyLockRecords();
-    } else {
+    // 新机制：节点只返回"已接收（进入缓存）"，真正结果要按 txHash 轮询上链。
+    // QccTxFlow 目前把 accepted 当失败，所以这里两种情况都认：
+    // - result.success（以后 QccTxFlow 修好之后走这里）
+    // - result.error 里是 accepted 文案（当前的实际情况）
+    // 【假设】accepted 判断靠匹配 msg 文案 "accepted"，比较脆弱；
+    // QccTxFlow 接入上链确认后这段可以删掉，只留 success 分支。
+    final accepted = result.success ||
+        (result.error?.toString().toLowerCase().contains('accepted') ?? false);
+    final txHash = (result.data?['txHash']?.toString().isNotEmpty ?? false)
+        ? result.data!['txHash'].toString()
+        : localTxHash;
+
+    if (!accepted || txHash.isEmpty) {
+      setState(() => _isSubmitting = false);
       LogObj.log("超级节点质押提交异常: ${result.error}");
       Tools.showToast(context, "错误: ${result.error}");
+      return;
     }
+
+    // ---- 轮询上链确认（默认 180 秒）----
+    final sw = Stopwatch()..start();
+    setState(() => _confirmHint = "节点已接收，等待上链确认...");
+    final confirmation = await QccTxConfirmService.waitForConfirmation(
+      txHash,
+      onAttempt: (_) {
+        if (mounted) {
+          setState(() => _confirmHint =
+          "节点已接收，等待上链确认... ${sw.elapsed.inSeconds}s");
+        }
+      },
+    );
+    if (!mounted) return;
+
+    final String status;
+    if (confirmation.isConfirmed) {
+      status = _isLock ? 'LOCKED' : 'UNLOCKED';
+    } else if (confirmation.isFailed) {
+      status = 'FAILED';
+    } else {
+      status = 'PENDING';
+    }
+
+    await PledgeFileStorage.saveTask({
+      'txHash': txHash,
+      'address': nowaddress,
+      'assetId': assetId,
+      'amount': amount, // 存的是换算后的最小单位，跟提交给链上的值保持一致
+      'protocol': PledgetType.superNode,
+      'actionType': _isLock ? PledgeActionType.lock : PledgeActionType.unlock,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'status': status,
+      if (confirmation.height != null) 'height': confirmation.height,
+    });
+
+    if (!mounted) return;
+    setState(() {
+      _isSubmitting = false;
+      _confirmHint = null;
+    });
+
+    if (confirmation.isConfirmed) {
+      Tools.showToast(context,
+          "${_isLock ? '✅ 超级节点质押' : '✅ 解押'}已上链（高度 ${confirmation.height ?? '-'}）");
+      _amountController.clear();
+    } else if (confirmation.isFailed) {
+      LogObj.log("超级节点质押上链失败: ${confirmation.rawStatus} ${confirmation.msg}");
+      Tools.showToast(context, "上链失败: ${confirmation.msg ?? confirmation.rawStatus}");
+    } else {
+      // 超时 ≠ 失败：交易已在节点缓存里。提醒不要重复提交，避免多锁一笔。
+      Tools.showToast(context,
+          "已提交但 180 秒内未确认上链，请稍后用下方查询核对，勿重复提交");
+      _amountController.clear();
+    }
+    _loadMyLockRecords();
   }
 
   @override
@@ -226,6 +295,12 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
           _buildSectionCard("本机质押历史（仅供参考）", Icons.receipt_long_outlined, _buildLockHistory()),
           const SizedBox(height: 32),
           _buildSubmitButton(),
+          if (_confirmHint != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text(_confirmHint!,
+                  style: TextStyle(fontSize: 12, color: Colors.teal.shade700)),
+            ),
           const SizedBox(height: 24),
           _buildSectionCard("查询该地址的超级节点质押记录", Icons.search, _buildQuerySection()),
         ],
@@ -341,6 +416,13 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
     return Column(
       children: _myLockRecords.take(10).map((r) {
         final isLock = (r['actionType'] ?? '') == PledgeActionType.lock;
+        final status = (r['status'] ?? '').toString();
+        // 旧记录（上链确认机制之前）的 status 是 LOCKED/UNLOCKED，含义是"已提交"
+        final statusText = switch (status) {
+          'PENDING' => ' · 待确认',
+          'FAILED' => ' · 失败',
+          _ => r['height'] != null ? ' · 高度 ${r['height']}' : '',
+        };
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Row(
@@ -349,8 +431,14 @@ class _SuperNodePledgeWidgetState extends State<SuperNodePledgeWidget> {
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
-                  "${isLock ? '+' : '-'}${r['amount']} (最小单位) · ${_shortHash(r['txHash']?.toString() ?? '')}",
-                  style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+                  "${isLock ? '+' : '-'}${r['amount']} (最小单位) · ${_shortHash(r['txHash']?.toString() ?? '')}$statusText",
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: 'monospace',
+                    color: status == 'FAILED'
+                        ? Colors.red.shade400
+                        : (status == 'PENDING' ? Colors.orange.shade700 : null),
+                  ),
                 ),
               ),
             ],

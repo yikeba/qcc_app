@@ -14,6 +14,7 @@ import 'package:qcc_flutter/utile/QccObj.dart';
 import 'package:qcc_flutter/views/setting/QccSettingPage.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import '../email/QccMailHomePage.dart';
+import '../qccsys/QccSysRootPage.dart';
 import '../qccwallet/QccWallet.dart';
 import '../qccwallet/walletviess/CreateWalletRouterPage.dart';
 import '../rule/QccRuleManagerPage.dart';
@@ -21,7 +22,6 @@ import '../rule/user/multiple/multicreat/QccMultiSigManagerPage.dart';
 import '../txdata/data/QccDataBroadcastPage.dart';
 import '../txdata/tx/QccTransferPage.dart';
 import '../txdata/QccTxManagerPage.dart';
-import '../views/buyqcc/QccWaterWidget.dart';
 import '../views/dex/QccMarketListPage.dart';
 import '../views/dex/QccMatchManagerPage.dart';
 import '../views/dex/QccOpenDataManager.dart';
@@ -30,6 +30,7 @@ import '../views/setting/AppTranslator.dart';
 import '../utile/QccStorage.dart';
 import '../views/hashviews/QccAddressManagerPage.dart';
 import '../views/myasset/QccAssetManagerPage.dart';
+
 
 
 class WalletInitPage extends StatefulWidget {
@@ -208,7 +209,6 @@ class _WalletInitPageState extends State<WalletInitPage> {
             const SizedBox(height: 10),
             Trans("基于 ML-DSA-87(Dilithium5) 算法保护您的资产", style: const TextStyle(color: Colors.white70), shrink: true, maxLines: 2),
             const SizedBox(height: 60),
-
             // 修改 WalletInitPage.dart 中的按钮
             _actionButton("生成新钱包", Colors.blueAccent, () async {
               // 1. 跳转并等待结果
@@ -562,7 +562,7 @@ class _WalletInitPageState extends State<WalletInitPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-         // const SizedBox(height: 1),
+          // const SizedBox(height: 1),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -730,10 +730,16 @@ class _WalletInitPageState extends State<WalletInitPage> {
       WalletFunction("数据上链", "data_broadcast", Icons.data_exploration, Colors.redAccent),
       WalletFunction("综合交易", "qcc_tx", Icons.price_change, Colors.purple),
       WalletFunction("现货交易", "spot_trade", Icons.verified_user_rounded, Colors.cyan),
-    //  WalletFunction("多签管理", "multi_sig", Icons.groups_rounded, Colors.brown),
+      //  WalletFunction("多签管理", "multi_sig", Icons.groups_rounded, Colors.brown),
       WalletFunction("规则管理", "rules", Icons.gavel_rounded, Colors.teal),
-     // WalletFunction("QCC放水", "buy_qcc", Icons.payment, Colors.blue),
-      WalletFunction("QCC邮箱", "email", Icons.email_outlined, Colors.blue),
+      // 本地资源图片替代 icon；图片加载失败时自动退回 icon
+      // 路径必须与插件 pubspec.yaml 里声明的完全一致（assets/qcc.jpeg），
+      // 读取时由 _buildFunctionIcon 带上 package: 'qcc_flutter'
+      WalletFunction("QCC 信息", "qccinfo", Icons.verified_user_outlined, const Color(0xFF1E293B),
+          image: "assets/qcc.jpeg"),
+      // ✅ QCC 邮箱：仅 debug / profile 模式显示，release 模式下菜单项不出现
+      if(widget.freeId=="admin")
+        WalletFunction("QCC邮箱", "email", Icons.email_outlined, Colors.blue),
       WalletFunction("去中心化交易所", "dex_token", Icons.data_exploration, Colors.deepPurpleAccent),
       WalletFunction("钱包设置", "settings", Icons.settings, Colors.amber),
     ];
@@ -771,14 +777,7 @@ class _WalletInitPageState extends State<WalletInitPage> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: item.color.withValues(alpha: 0.1),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(item.icon, color: item.color, size: 28),
-                  ),
+                  _buildFunctionIcon(item),
                   const SizedBox(height: 10),
                   Trans(item.title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black87), shrink: true, maxLines: 2),
                 ],
@@ -790,6 +789,46 @@ class _WalletInitPageState extends State<WalletInitPage> {
     );
   }
 
+
+  /// 功能图标：有 image 用本地资源图片，否则用 icon。
+  /// 两种情况外框尺寸一致（52×52 圆形 = icon 28 + 内边距 12×2），宫格对齐不变。
+  Widget _buildFunctionIcon(WalletFunction item) {
+    final Widget iconCircle = Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: item.color.withValues(alpha: 0.1),
+        shape: BoxShape.circle,
+      ),
+      child: Icon(item.icon, color: item.color, size: 28),
+    );
+    if (item.image == null) return iconCircle;
+
+    return Container(
+      width: 52,
+      height: 52,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: item.color.withValues(alpha: 0.15), width: 1),
+      ),
+      child: ClipOval(
+        child: Image.asset(
+          item.image!,
+          // ✅ 关键：本页面在 qcc_flutter 插件里，资源打包在插件包内，
+          // 宿主 App 运行时实际路径是 packages/qcc_flutter/assets/qcc.jpeg，
+          // 不指定 package 会去宿主 App 自己的 assets 里找，必然找不到。
+          package: WalletFunction.assetPackage,
+          width: 52,
+          height: 52,
+          fit: BoxFit.cover,
+          // 资源未声明或路径写错时不报红屏，退回 icon；同时打日志便于排查
+          errorBuilder: (_, error, ___) {
+            LogObj.log("功能图标加载失败: packages/${WalletFunction.assetPackage}/${item.image} -> $error");
+            return iconCircle;
+          },
+        ),
+      ),
+    );
+  }
 
   void _onFunctionTap(WalletFunction item) {
     // 使用 item.name 进行逻辑分流
@@ -821,7 +860,6 @@ class _WalletInitPageState extends State<WalletInitPage> {
         );
         break;
       case "email" :
-      //QccMailTestPage
         Navigator.push(
           context,
           MaterialPageRoute(
@@ -877,10 +915,10 @@ class _WalletInitPageState extends State<WalletInitPage> {
           }
         });
         break;
-      case "buy_qcc":
+      case "qccinfo":
         Navigator.push(
           context,
-          MaterialPageRoute(builder: (context) => QccWaterWidget ()),
+          MaterialPageRoute(builder: (context) => QccSysRootPage()),
         );
         break;
       case "spot_trade":
@@ -908,6 +946,12 @@ class WalletFunction {
   final IconData icon;
   final Color color;
   final Widget? targetPage;
+  /// 可选：本地资源图片路径（需在 pubspec.yaml 的 flutter.assets 中声明）。
+  /// 设置后优先显示图片，icon 作为加载失败时的兜底。
+  final String? image;
 
-  WalletFunction(this.title,this.name,this.icon, this.color, {this.targetPage});
+  /// 资源所在的包名 = 插件 pubspec.yaml 的 name
+  static const String assetPackage = "qcc_flutter";
+
+  WalletFunction(this.title,this.name,this.icon, this.color, {this.targetPage, this.image});
 }

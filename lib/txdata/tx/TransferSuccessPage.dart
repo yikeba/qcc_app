@@ -7,19 +7,60 @@ import '../../../home/QccExplorerService.dart';
 import '../../../utile/Tools.dart';
 import '../../views/setting/AppTranslator.dart';
 import 'QccTransaction.dart';
+import 'QccTxConfirmService.dart';
 
-class TransferSuccessPage extends StatelessWidget {
-  final QccTransaction transaction; // 使用解析后的对象
-  const TransferSuccessPage({
-    super.key,
-    required this.transaction,
-  });
+/// 交易结果页：按上链确认状态显示三种头部
+/// - confirmed：已上链（高度、容器、确认时间）
+/// - pending  ：已被节点接收、等待确认超时——不是失败，提供"刷新状态"
+/// - failed   ：节点返回了明确失败状态
+/// confirmState 为 null（旧入口 fromJson 构建的对象）时按 confirmed 展示，
+/// 保持旧调用方行为不变。
+class TransferSuccessPage extends StatefulWidget {
+  final QccTransaction transaction;
+  const TransferSuccessPage({super.key, required this.transaction});
+
+  @override
+  State<TransferSuccessPage> createState() => _TransferSuccessPageState();
+}
+
+class _TransferSuccessPageState extends State<TransferSuccessPage> {
+  late QccTransaction _tx;
+  bool _checking = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tx = widget.transaction;
+    LogObj.log("交易结果页: ${_tx.txHash} 状态=${_tx.confirmState} 金额=${_tx.amount} 高度=${_tx.height}");
+  }
+
+  Future<void> _recheck() async {
+    setState(() => _checking = true);
+    final c = await QccTxConfirmService.waitForConfirmation(
+      _tx.txHash,
+      timeout: const Duration(seconds: 15),
+    );
+    if (!mounted) return;
+    setState(() {
+      _checking = false;
+      if (!c.isPending) _tx = _tx.withConfirmation(c);
+    });
+    if (c.isPending) Tools.showToast(context, "仍在等待上链，请稍后再试");
+  }
 
   @override
   Widget build(BuildContext context) {
-    // 加一下运行时类型日志：如果修复后个别金额还是不对，把这行 log 的输出
-    // 发我一下，能确认 transaction.amount 实际是 String 还是 double/int。
-    LogObj.log("转账金额数据:${transaction.amount} (运行时类型: ${transaction.amount.runtimeType})");
+    final pending = _tx.isPending;
+    final failed = _tx.isFailed;
+
+    final IconData icon = failed
+        ? Icons.cancel_rounded
+        : (pending ? Icons.hourglass_top_rounded : Icons.check_circle_rounded);
+    final Color iconColor =
+    failed ? Colors.red : (pending ? Colors.orange : Colors.green);
+    final String title =
+    failed ? "交易失败" : (pending ? "已提交，等待上链确认" : "转账成功");
+
     return Scaffold(
       backgroundColor: const Color(0xFFF4F7F9),
       appBar: AppBar(
@@ -31,24 +72,36 @@ class TransferSuccessPage extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 24),
         child: Column(
           children: [
-            // 1. 成功状态头
+            // 1. 状态头
             const SizedBox(height: 20),
-            const Icon(Icons.check_circle_rounded, color: Colors.green, size: 80),
+            Icon(icon, color: iconColor, size: 80),
             const SizedBox(height: 16),
-            Trans("转账成功", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            Trans(title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            if (failed && (_tx.msg?.isNotEmpty ?? false)) ...[
+              const SizedBox(height: 6),
+              Text(_tx.msg!, style: TextStyle(fontSize: 13, color: Colors.red.shade400)),
+            ],
+            if (pending) ...[
+              const SizedBox(height: 6),
+              Trans("交易已进入节点缓存，通常数秒内上链；可稍后刷新状态",
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            ],
             const SizedBox(height: 8),
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text("${_formatAmount(transaction.amount, transaction.assetId)} ",
-                    style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w900)),
-                Text(transaction.assetId, // 如果有类型转换逻辑
+                Text("${_formatAmount(_tx.amount, _tx.assetId)} ",
+                    style: TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.w900,
+                        color: failed ? Colors.grey : Colors.black)),
+                Text(_tx.assetId,
                     style: const TextStyle(fontSize: 18, color: Colors.blueAccent)),
               ],
             ),
             const SizedBox(height: 40),
 
-            // 2. 存证卡片 (电子收据风格)
+            // 2. 存证卡片
             Container(
               decoration: BoxDecoration(
                 color: Colors.white,
@@ -57,10 +110,17 @@ class TransferSuccessPage extends StatelessWidget {
               ),
               child: Column(
                 children: [
-                  _buildDetailItem(context, "发送方", _shortAddr(transaction.from), transaction.from),
-                  _buildDetailItem(context, "接收方", _shortAddr(transaction.to), transaction.to),
-                  _buildDetailItem(context, "交易类型", transaction.type.toUpperCase(), ""),
-                  _buildDetailItem(context, "哈希", _shortAddr(transaction.txHash), transaction.txHash, isHash: true),
+                  _buildDetailItem(context, "发送方", _shortAddr(_tx.from), _tx.from),
+                  _buildDetailItem(context, "接收方", _shortAddr(_tx.to), _tx.to),
+                  _buildDetailItem(context, "交易类型", _tx.type.toUpperCase(), ""),
+                  _buildDetailItem(context, "哈希", _shortAddr(_tx.txHash), _tx.txHash, isHash: true),
+                  if (_tx.height != null)
+                    _buildDetailItem(context, "区块高度", "${_tx.height}", "${_tx.height}"),
+                  if (_tx.containerId != null)
+                    _buildDetailItem(context, "容器", _shortAddr(_tx.containerId!), _tx.containerId!),
+                  if (_tx.confirmTimestamp != null)
+                    _buildDetailItem(context, "确认时间", _fmtLocalTime(_tx.confirmTimestamp!),
+                        _tx.confirmDateUTC ?? ""),
                 ],
               ),
             ),
@@ -68,11 +128,31 @@ class TransferSuccessPage extends StatelessWidget {
             const SizedBox(height: 40),
 
             // 3. 动作按钮
+            if (pending)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: SizedBox(
+                  width: double.infinity,
+                  height: 55,
+                  child: OutlinedButton.icon(
+                    onPressed: _checking ? null : _recheck,
+                    icon: _checking
+                        ? const SizedBox(
+                        width: 16, height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.refresh),
+                    label: Trans(_checking ? "正在查询..." : "刷新上链状态"),
+                    style: OutlinedButton.styleFrom(
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                    ),
+                  ),
+                ),
+              ),
             SizedBox(
               width: double.infinity,
               height: 55,
               child: ElevatedButton(
-                onPressed: () => _openExplorer(transaction.txHash),
+                onPressed: () => _openExplorer(_tx.txHash),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF1A1C1E),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
@@ -113,8 +193,10 @@ class TransferSuccessPage extends StatelessWidget {
                         fontWeight: FontWeight.bold,
                         color: isHash ? Colors.blue : Colors.black87
                     )),
-                const SizedBox(width: 4),
-                const Icon(Icons.copy_rounded, size: 14, color: Colors.grey),
+                if (fullText.isNotEmpty) ...[
+                  const SizedBox(width: 4),
+                  const Icon(Icons.copy_rounded, size: 14, color: Colors.grey),
+                ],
               ],
             ),
           )
@@ -125,32 +207,18 @@ class TransferSuccessPage extends StatelessWidget {
 
   String _shortAddr(String addr) => addr.length > 16 ? "${addr.substring(0, 8)}...${addr.substring(addr.length - 8)}" : addr;
 
-  /// 【本次修正，对应你指出的"这会适配其他资产转账，其他资产未必9位"】
-  /// 上一版直接硬编码按 9 位小数格式化——9 位是 QCC 自己的精度，但这个
-  /// 成功页是通用的转账结果页，其他资产(比如 USDS 是 2 位)未必是 9 位，
-  /// 硬编码 9 位有两个问题：1. 如果上游浮点换算本身带有超出该资产实际
-  /// 精度的噪声(比如 2 位精度的资产算出 0.05000000037)，去掉末尾 0 之后
-  /// 这段噪声会被当成"有效小数"露出来，显示成不属于该资产的假精度；
-  /// 2. 语义上也不对——每个资产的最小单位是由它自己的 precision 决定的，
-  /// 不该所有资产共用一个显示位数。
-  ///
-  /// 改成和 QccActiveWallet.dart 里同一套查资产精度的写法：
-  ///   QccAssetService().followAsset.firstWhere(
-  ///     (a) => a.assetId.toUpperCase() == assetId.toUpperCase(),
-  ///     orElse: () => QccAsset(assetId: assetId, type: "COIN", precision: 9, address: 'Q...'),
-  ///   )
-  /// 查不到该资产时才兜底按 9 位（这个兜底值和 QccActiveWallet.dart 里的
-  /// 默认值保持一致，不是我随便定的）。查到之后就按这个资产"自己的"
-  /// precision 做 toStringAsFixed + 去掉末尾多余 0，这样：
-  /// - USDS(2位)：0.01 正常显示"0.01"，不会因为格式化位数不对而消失或跑出多余小数；
-  /// - QCC(9位)：0.000000001 这种到第9位的极小额度也能正常显示；
-  /// - 任何资产都不会显示超出自己精度之外的"假小数"。
+  /// 确认时间按手机本地时区显示；点击复制的是节点给的 UTC 字符串。
+  String _fmtLocalTime(int ms) {
+    final t = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    String p(int v) => v.toString().padLeft(2, '0');
+    return "${t.year}-${p(t.month)}-${p(t.day)} ${p(t.hour)}:${p(t.minute)}:${p(t.second)}";
+  }
+
+  /// 按资产自身精度格式化金额，去掉末尾多余的 0；查不到资产按 9 位兜底。
   String _formatAmount(dynamic amount, String assetId) {
     if (amount == null) return "0";
 
     double? val = amount is num ? amount.toDouble() : double.tryParse(amount.toString());
-
-    // 解析失败就原样兜底显示，好歹不让页面崩溃或者显示 null
     if (val == null) return amount.toString();
 
     final assetInstance = QccAssetService().followAsset.firstWhere(
@@ -167,8 +235,6 @@ class TransferSuccessPage extends StatelessWidget {
   }
 
   void _openExplorer(String hash) {
-    // 以后接入你的开源浏览器地址
-    // print("Opening Explorer: https://test.qccio.com/tx/$hash");
     Tools.openChrome("${QccExplorerService.baseUrl}/v1/hash/$hash");
   }
 }

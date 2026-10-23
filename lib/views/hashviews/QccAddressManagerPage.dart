@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:qcc_flutter/utile/LogObj.dart';
+import '../../qccnodemap/QccInterestLedgerPage.dart';
 import '../setting/AppTranslator.dart';
 import 'GasRecord.dart';
 import 'QccDataMeta.dart';
 import 'QccDetailPage.dart';
 import '../../home/QccExplorerService.dart';
+import 'package:qcc_flutter/qccnodemap/QccMinerReward.dart';
+
 
 class QccAddressManagerPage extends StatefulWidget {
   final String address;
@@ -25,22 +28,57 @@ class _QccAddressManagerPageState extends State<QccAddressManagerPage>
   List<QccDataMeta> _dataEntries = [];
   List<GasRecord>   _gasRecords  = []; // ← 改用 GasRecord
 
+  // 收益类明细：固定 tab，没有数据（或查询失败）显示"暂无记录"
+  QccInterestHistory? _interest;   // 信托质押利息
+  QccMinerRewardDetail? _miner;    // 超级节点出块收益（假设 nodeId == 质押地址）
+  static const int _previewCount = 20;
+  static const int _tabCount = 5;
+
+  bool get _hasInterest => _interest != null && !_interest!.isEmpty;
+  bool get _hasMiner => _miner != null && _miner!.containers > 0;
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this, initialIndex: widget.initialTabIndex);
+    _tabController = TabController(
+      length: _tabCount,
+      vsync: this,
+      initialIndex: widget.initialTabIndex.clamp(0, _tabCount - 1),
+    );
     _loadAllData();
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadAllData() async {
     if (!mounted) return;
     setState(() => _isLoading = true);
 
+    // 收益类查询与原有查询并行；失败只记日志、不显示对应 tab，不影响原有 3 个 tab
+    final interestF = QccInterestService.fetchHistory(widget.address, limit: _previewCount)
+        .then<QccInterestHistory?>((v) => v)
+        .catchError((e) {
+      LogObj.log('地址利息查询失败(忽略): $e');
+      return null;
+    });
+    final minerF = QccMinerRewardService.fetchDetail(widget.address, _previewCount)
+        .then<QccMinerRewardDetail?>((v) => v)
+        .catchError((e) {
+      LogObj.log('地址节点收益查询失败(忽略): $e');
+      return null;
+    });
+
     final results = await Future.wait([
       QccExplorerService.fetchAddressHashes(widget.address),
       // fetchGasDetails 现在返回 GasRecordPage，调用方解包 .records
       QccExplorerService.fetchGasDetails(widget.address),
     ]);
+    final interest = await interestF;
+    final miner = await minerF;
 
     final List<String>      hashes  = results[0] as List<String>;
     final GasRecordPage     gasPage = results[1] as GasRecordPage; // ← 新类型
@@ -54,10 +92,13 @@ class _QccAddressManagerPageState extends State<QccAddressManagerPage>
       _transactions = detailResults.where((e) => e.entryType == QccEntryType.transaction).toList();
       _dataEntries  = detailResults.where((e) => e.entryType == QccEntryType.data).toList();
       _gasRecords   = gasPage.records; // ← 直接用 GasRecord 列表
+      _interest     = interest;
+      _miner        = miner;
       _isLoading    = false;
     });
 
-    LogObj.log('数据加载完成：交易(${_transactions.length}), ''存证(${_dataEntries.length}), Gas(${_gasRecords.length})');
+    LogObj.log('数据加载完成：交易(${_transactions.length}), ''存证(${_dataEntries.length}), Gas(${_gasRecords.length})'
+        ', 利息(${_hasInterest ? _interest!.records.length : 0}), 节点收益(${_hasMiner ? _miner!.containers : 0})');
   }
 
   @override
@@ -77,6 +118,9 @@ class _QccAddressManagerPageState extends State<QccAddressManagerPage>
         ),
         bottom: TabBar(
           controller: _tabController,
+          // 5 个 tab 窄屏放不下，可横向滚动
+          isScrollable: true,
+          tabAlignment: TabAlignment.start,
           indicatorColor: Colors.blue.shade800,
           labelColor: Colors.blue.shade800,
           unselectedLabelColor: Colors.grey,
@@ -84,6 +128,10 @@ class _QccAddressManagerPageState extends State<QccAddressManagerPage>
             Tab(text: '交易轨迹 (${_transactions.length})'),
             Tab(text: '存证数据 (${_dataEntries.length})'),
             Tab(text: 'Gas 明细 (${_gasRecords.length})'),
+            Tab(text: _hasInterest
+                ? '利息收益 (${_interest!.records.length}${_interest!.hasMore ? '+' : ''})'
+                : '利息收益 (0)'),
+            Tab(text: '节点收益 (${_hasMiner ? _miner!.containers : 0})'),
           ],
         ),
       ),
@@ -95,9 +143,155 @@ class _QccAddressManagerPageState extends State<QccAddressManagerPage>
           _buildList(_transactions, Icons.swap_horiz, Colors.orange),
           _buildList(_dataEntries, Icons.description, Colors.blue),
           _buildGasList(),
+          _hasInterest ? _buildInterestTab() : const Center(child: Trans('暂无利息收益记录')),
+          _hasMiner ? _buildMinerTab() : const Center(child: Trans('暂无节点收益记录')),
         ],
       ),
     );
+  }
+
+  // ───────────────────── 利息收益（信托质押） ─────────────────────
+
+  Widget _buildInterestTab() {
+    final h = _interest!;
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      children: [
+        _incomeHeader(
+          icon: Icons.savings_outlined,
+          color: Colors.teal,
+          title: '累计利息收益',
+          amount: QccMinerRewardService.fmt(h.totalReceived, digits: 6),
+          sub: '已分配 ${h.records.length}${h.hasMore ? '+' : ''} 期',
+        ),
+        ...h.records.map((r) {
+          final ratio = r.shareRatio;
+          return ListTile(
+            leading: CircleAvatar(
+              backgroundColor: Colors.teal.withOpacity(0.1),
+              child: const Icon(Icons.savings_outlined, color: Colors.teal, size: 20),
+            ),
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('周期 ${r.cycleId}',
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                Text('+${QccMinerRewardService.fmt(r.amount, digits: 6)} QCC',
+                    style: TextStyle(
+                        color: Colors.teal.shade700, fontWeight: FontWeight.bold, fontSize: 13)),
+              ],
+            ),
+            subtitle: Text(
+              '计息本金 ${QccMinerRewardService.fmt(r.stakedBasis)}'
+                  '${ratio == null ? '' : ' · 占本期 ${(ratio * 100).toStringAsFixed(2)}%'}'
+                  ' · ${_fmtTime(r.containerTime)}',
+              style: const TextStyle(fontSize: 10, color: Colors.grey),
+            ),
+          );
+        }),
+        _moreButton('查看完整利息明细',
+                () => QccInterestLedgerPage(address: widget.address)),
+      ],
+    );
+  }
+
+  // ───────────────────── 节点收益（超级节点出块） ─────────────────────
+
+  Widget _buildMinerTab() {
+    final d = _miner!;
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      children: [
+        _incomeHeader(
+          icon: Icons.dns_outlined,
+          color: Colors.indigo,
+          title: '累计节点收益',
+          amount: QccMinerRewardService.fmt(d.total, digits: 6),
+          sub: 'Gas 分成 ${QccMinerRewardService.fmt(d.gasShare)}'
+              ' · 里程碑 ${QccMinerRewardService.fmt(d.milestone)}'
+              ' · ${d.containers} 个容器',
+        ),
+        ...d.recent.map((r) => ListTile(
+          leading: CircleAvatar(
+            backgroundColor: Colors.indigo.withOpacity(0.1),
+            child: const Icon(Icons.dns_outlined, color: Colors.indigo, size: 20),
+          ),
+          title: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('高度 ${r.height}',
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              Text('+${QccMinerRewardService.fmt(r.total, digits: 6)} QCC',
+                  style: TextStyle(
+                      color: r.milestone > 0 ? Colors.amber.shade800 : Colors.indigo,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13)),
+            ],
+          ),
+          subtitle: Text(
+            '${r.txCount} 笔交易'
+                '${r.milestone > 0 ? ' · 含里程碑奖励' : ''}'
+                ' · ${_fmtTime(r.time)}',
+            style: const TextStyle(fontSize: 10, color: Colors.grey),
+          ),
+        )),
+        _moreButton('查看完整节点收益',
+                () => QccMinerRewardPage(nodeId: widget.address)),
+      ],
+    );
+  }
+
+  Widget _incomeHeader({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String amount,
+    required String sub,
+  }) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 2),
+                Text('$amount QCC',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: color)),
+                const SizedBox(height: 2),
+                Text(sub, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _moreButton(String label, Widget Function() page) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: OutlinedButton(
+        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => page())),
+        child: Text(label),
+      ),
+    );
+  }
+
+  String _fmtTime(int ms) {
+    if (ms <= 0) return '--';
+    final t = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    String p(int v) => v.toString().padLeft(2, '0');
+    return '${t.year}-${p(t.month)}-${p(t.day)} ${p(t.hour)}:${p(t.minute)}';
   }
 
   // 通用列表（交易 & 存证）

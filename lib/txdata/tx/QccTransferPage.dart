@@ -1,4 +1,3 @@
-
 import 'dart:convert';
 import 'package:convert/convert.dart';
 import 'package:flutter/foundation.dart';
@@ -18,13 +17,13 @@ import '../../../qccwallet/QccWallet.dart';
 import '../../../utile/Tools.dart';
 import '../../../home/QccExplorerService.dart';
 import '../../../utile/QccObj.dart';
-import '../../qccwallet/QccApiService.dart';
 import '../../views/myasset/QccAssetService.dart' as server;
 import '../../views/setting/AppTranslator.dart';
 import '../../views/setting/QccPassDialog.dart';
 import '../../views/toolviews/QccLoading.dart';
 import 'TransferSuccessPage.dart';
 import 'package:qcc_flutter/txdata/tx/QccTransaction.dart' as tx;
+import 'package:qcc_flutter/txdata/tx/QccTxConfirmService.dart';
 
 // 修改后的 QccTransferPage 构造函数
 class QccTransferPage extends StatefulWidget {
@@ -114,7 +113,6 @@ class _QccTransferPageState extends State<QccTransferPage> {
                         child: TextField(
                           controller: _amountController,
                           keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                          // 2. 增加输入限制，防止用户输入多个小数点或非数字字符
                           inputFormatters: [
                             FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
                           ],
@@ -160,22 +158,16 @@ class _QccTransferPageState extends State<QccTransferPage> {
   }
 
   Future<void> _onAddressScan() async {
-    // 1. 调起扫码页面
     String? scanResult = await QccScanner.scan(context);
     if (scanResult != null && scanResult.isNotEmpty) {
-      // 2. 简单的地址格式初步校验 (根据 QCC 地址特征，例如以 'QCC' 开头或长度判断)
-      // 如果你之前的备份二维码也是扫这个，这里需要区分是“备份数据”还是“普通地址”
       if (scanResult.startsWith("QCC_SECURE_V2:")) {
         Tools.showToast(context, "这是备份数据，请在地址管理中使用扫码恢复");
         return;
       }
-      // 3. 将扫描到的地址填入输入框
       setState(() {
         _toController.text = scanResult;
       });
-      // 4. 反馈
       HapticFeedback.lightImpact(); // 震动反馈
-     // Tools.showToast(context, "地址已填入");
     }
   }
 
@@ -222,19 +214,15 @@ class _QccTransferPageState extends State<QccTransferPage> {
       return;
     }
 
-
     // 2. 获取密码
     String? password = await QccPassDialog.show(context);
     if (password == null) return;
 
-
-    // --- 关键优化：在所有耗时操作开始前，立即弹出唯一一次 Loading ---
     final statusNotifier = ValueNotifier<TxStep>(TxStep.restoring);
     _showDynamicLoading(context, statusNotifier);
 
     try {
-      // ---- A. 还原钱包 (子线程计算) ----
-      // 逻辑：先切状态，再跑耗时任务
+      // ---- A. 还原钱包 ----
       statusNotifier.value = TxStep.restoring;
       final sw = Stopwatch()..start();
 
@@ -245,7 +233,7 @@ class _QccTransferPageState extends State<QccTransferPage> {
       }
       LogObj.log("钱包信息还原成功: ${wallet.address},耗时${sw.elapsedMilliseconds}ms");
 
-      // ---- B. 构建交易 (网络请求) ----
+      // ---- B. 构建交易 ----
       statusNotifier.value = TxStep.building;
       int amountInt =server.QccAssetService().getAmountRaw(_selectedAsset, amountStr);
 
@@ -260,7 +248,7 @@ class _QccTransferPageState extends State<QccTransferPage> {
       tran.memo = "";
       tran.finalizeId();
 
-      // ---- C. 执行抗量子签名 (子线程高能计算) ----
+      // ---- C. 抗量子签名 ----
       statusNotifier.value = TxStep.signing;
       final QccPacket packet = await compute(_signTransactionTask,{
         'tx': tran,
@@ -268,43 +256,72 @@ class _QccTransferPageState extends State<QccTransferPage> {
         'pubHex': wallet.pubkey!
       });
 
-      // ---- D. 提交交易 (网络请求) ----
+      // ---- D. 提交交易：新机制下只返回"已接收"(进入节点缓存) ----
       statusNotifier.value = TxStep.submitting;
-      String url = "${QccExplorerService.baseUrl}/v1/txm";
+      final String submitBase = QccExplorerService.baseUrl;
+      String url = "$submitBase/v1/txm";
+      LogObj.log("当期交易提交访问节点：${url}");
       final response = await http.post(
         Uri.parse(url),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode(packet.toJson()),
       );
-
-      // --- 任务完成：关闭 Loading ---
-      if (Navigator.canPop(context)) Navigator.pop(context);
       LogObj.log("普通转账返回参数${response.body}");
-      if (response.statusCode == 200) {
-        final qccData = tx.QccTransaction.fromJson(response.body);
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => TransferSuccessPage(transaction: qccData),
-          ),
-        );
-      } else {
-        Tools.showToast(context, "网络异常: ${response.statusCode}");
-      }
+      final String txHash = _extractAcceptedTxHash(response);
 
+      // ---- E. 等待上链确认：任一最高高度节点 /v1/hash 返回 SUCCESS 即确认 ----
+      statusNotifier.value = TxStep.building;
+      final confirmation = await QccTxConfirmService.waitForConfirmation(
+        txHash,
+        extraBaseUrls: [submitBase],
+      );
+
+      // 链上返回了交易本体就用链上数据；超时(pending)则用本地交易兜底展示
+      final qccData = tx.QccTransaction.fromConfirmation(
+        confirmation,
+        localTx: Map<String, dynamic>.from(tran.toJson()),
+      );
+
+      if (Navigator.canPop(context)) Navigator.pop(context);
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => TransferSuccessPage(transaction: qccData),
+        ),
+      );
     } catch (e) {
-      // --- 异常处理：确保出错时关闭 Loading 并提示用户 ---
       if (Navigator.canPop(context)) Navigator.pop(context);
       LogObj.log("交易执行出错: $e");
       Tools.showToast(context, "操作失败: ${e.toString()}");
     }
   }
 
+  /// 解析交易接口的"接收"响应，返回 txHash；未被接收则抛异常（带服务端 msg）。
+  /// 接收响应示例：{"status":"accepted","code":"ACCEPTED","txHash":"...","msg":"..."}
+  /// 假设：status 为 accepted/ok/success（或缺省）都算接收；其它（例如缓存满
+  /// 返回的系统忙）按失败处理。
+  String _extractAcceptedTxHash(http.Response resp) {
+    Map<String, dynamic> body = {};
+    try {
+      final d = jsonDecode(resp.body);
+      if (d is Map) body = Map<String, dynamic>.from(d);
+    } catch (_) {}
+
+    final status = (body['status'] as String?)?.toLowerCase();
+    final txHash = body['txHash'];
+    final accepted = status == null || const {'accepted', 'ok', 'success'}.contains(status);
+    if (resp.statusCode == 200 && accepted && txHash is String && txHash.isNotEmpty) {
+      return txHash;
+    }
+    final reason = body['msg'] ?? body['code'] ?? "HTTP ${resp.statusCode}";
+    throw Exception("交易未被节点接收: $reason");
+  }
+
 
 // ------------------ 静态子线程任务 ------------------
 
   static Future<QccPacket> _signTransactionTask(Map<String,dynamic> data) async {
-    // 在子线程中调用 C FFI 进行 Dilithium5 签名
     QccTransactionData tx=data["tx"];
     String payloadJson= jsonEncode(tx.toJson());
     if (payloadJson.isEmpty) {
@@ -316,8 +333,8 @@ class _QccTransferPageState extends State<QccTransferPage> {
         tx.toSign()
     );
     String signature = hex.encode(signatureBytes);
-    LogObj.log("🛡️ 签名原始字节长度: ${signatureBytes.length}"); // 理论上应为 4595
-    LogObj.log("🛡️ 签名 Hex 字符串长度: ${signature.length}"); // 理论上应为 9190
+    LogObj.log("🛡️ 签名原始字节长度: ${signatureBytes.length}");
+    LogObj.log("🛡️ 签名 Hex 字符串长度: ${signature.length}");
     QccPacket qp= await QccDataProtocol.encodeTransaction(
       payloadJson: payloadJson,
       privateKeyHex: data['privHex']!,
@@ -347,16 +364,12 @@ class _QccTransferPageState extends State<QccTransferPage> {
                     const SizedBox(height: 10),
                     const CircularProgressIndicator(),
                     const SizedBox(height: 25),
-                    // 使用你定义的 _stepMsgs
-                    Text(
-                      _stepMsgs[step] ?? "请稍候...",
-                      textAlign: TextAlign.center,
+                    Trans("请稍候...",
                       style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue),
                     ),
                     const SizedBox(height: 15),
                     Trans(
                       "安全提示：抗量子签名需要约 1分钟，请不要关闭或切换到后台。\n正在进行极度复杂的格数学计算以保护资产，请勿离开或关闭屏幕。",
-                      //textAlign: TextAlign.center,
                       style: TextStyle(fontSize: 11, color: Colors.grey),
                     ),
                   ],
@@ -370,11 +383,3 @@ class _QccTransferPageState extends State<QccTransferPage> {
   }
 
 }
-
-// 严格对齐你代码中的 Map 变量名
-final Map<TxStep, String> _stepMsgs = {
-  TxStep.building: "正在构建交易数据...",
-  TxStep.restoring: "🔐 正在从安全加固区还原钱包...",
-  TxStep.signing: "✍️ 正在进行抗量子签名 (格数学计算)...",
-  TxStep.submitting: "🚀 签名成功！正在同步至量子链节点...",
-};

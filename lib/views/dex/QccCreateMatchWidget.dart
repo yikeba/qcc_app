@@ -21,6 +21,11 @@ import '../toolviews/QccLoading.dart';
 import 'util/DexUtil.dart' as DexUtil;
 import '../../procotol/QccMatchLogic.dart';
 import 'package:http/http.dart' as http;
+import 'package:convert/convert.dart';
+import 'package:qcc_flutter/home/QccExplorerService.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
+import 'package:qcc_flutter/home/QccTxConfirmDialog.dart';
+import '../../qccwallet/QccLibOqsSigner.dart';
 
 import 'trade/QccTxSuccessWidget.dart';
 
@@ -217,7 +222,7 @@ class _QccCreateMatchWidgetState extends State<QccCreateMatchWidget> {
                             color: Colors.blueGrey,
                             onAssetChanged: (v) => setState(() =>_quoteAssetId = v)
                         ),
-                      /*  ActionChip(
+                        /*  ActionChip(
                           avatar: const Icon(Icons.monetization_on, size: 16, color: Colors.teal),
                           label: Text(_quoteAssetId, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.teal)),
                           backgroundColor: Colors.teal.withOpacity(0.1),
@@ -469,6 +474,13 @@ class _QccCreateMatchWidgetState extends State<QccCreateMatchWidget> {
     final statusNotifier = ValueNotifier<TxStep>(TxStep.restoring);
     QccLoading.show(context, statusNotifier);
 
+    // 原写法：成功路径先 pop loading，后续 throw 时 catch 再 pop 一次，弹掉的是当前页面
+    bool loadingOpen = true;
+    void closeLoading() {
+      if (loadingOpen && mounted && Navigator.canPop(context)) Navigator.pop(context);
+      loadingOpen = false;
+    }
+
     try {
       statusNotifier.value = TxStep.restoring;
 
@@ -502,44 +514,83 @@ class _QccCreateMatchWidgetState extends State<QccCreateMatchWidget> {
       tx.matchLogic = logic;
       tx.finalizeId();
 
+      // 🐛 原来直接调 QccDataProtocol.encodeTransaction()，它内部的签名是旧逻辑
+      // （SingleSigTokenIssueWidget 里记录过：signature 恒为空 → Invalid Signature）。
+      // 改为和 QccTransferPage 一致：对 tx.toSign() 做 ML-DSA 签名后覆盖 packet.signature。
       statusNotifier.value = TxStep.signing;
       final QccPacket packet = await compute(_signTransactionTask, {
-        'payloadJson': jsonEncode(tx.toJson()),
+        'tx': tx,
         'privHex': wallet.privateKey!,
-        'pubHex': wallet.pubkey!
+        'pubHex': wallet.pubkey!,
       });
 
+      // 原来写死 https://tx.qccio.com，统一走 baseUrl（转账 /v1/txm 已在 baseUrl 实测通过）
       statusNotifier.value = TxStep.submitting;
       final response = await http.post(
-        Uri.parse("https://tx.qccio.com/v1/txm"),
+        Uri.parse("${QccExplorerService.baseUrl}/v1/txm"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode(packet.toJson()),
       );
 
-      if (Navigator.canPop(context)) Navigator.pop(context);
+      closeLoading();
+      LogObj.log("Open 交易返回: ${response.body}");
+      // 原来只看 HTTP 200 就弹成功页；现在必须 code==ACCEPTED 且带 txHash
+      final String txHash = QccTxStatusService.parseAcceptedTxHash(response);
+      final Map<String, dynamic> result = Map<String, dynamic>.from(jsonDecode(response.body) as Map);
 
-      if (response.statusCode == 200) {
-        final Map<String, dynamic> result = jsonDecode(response.body);
+      if (!mounted) return;
+      final bool isDex = _selectedType == QccMatchType.dex;
+      final TxChainStatus? st = await showDialog<TxChainStatus?>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => QccTxConfirmDialog(
+          txHash: txHash,
+          confirmedTitle: isDex ? "挂单已上链" : "交易已上链",
+          details: [
+            Text(isDex
+                ? "${_direction == DexUtil.TradeDirection.buy ? '买入' : '卖出'} ${_amountController.text} $_baseAssetId"
+                : "投放 ${_amountController.text} $_baseAssetId"),
+            if (isDex) Text("价格：${_rateController.text} $_quoteAssetId", style: const TextStyle(fontSize: 12)),
+            Text("锁定：$finalAmountStr $finalLockedAssetId", style: const TextStyle(fontSize: 12, color: Colors.black54)),
+          ],
+          footer: "挂单上链后才会出现在盘口、才能被他人成交。",
+        ),
+      );
+
+      if (!mounted) return;
+      if (st?.state == TxChainState.confirmed) {
         showModalBottomSheet(
           context: context,
           isScrollControlled: true,
           backgroundColor: Colors.transparent,
-          builder: (context) => QccTxSuccessWidget(response: result),
+          builder: (context) => QccTxSuccessWidget(response: {
+            ...result,
+            'chainStatus': 'confirmed',
+            if (st!.blockHeight != null) 'blockHeight': st.blockHeight,
+          }),
         );
+      } else if (st?.state == TxChainState.failed) {
+        Tools.showToast(context, "挂单上链失败：${st!.message ?? '未知原因'}，资产未被锁定");
       } else {
-        throw Exception("节点响应错误: ${response.statusCode}");
+        Tools.showToast(context, "挂单已受理，尚未确认上链，请稍后在「我的交易」中查看");
       }
     } catch (e) {
-      if (Navigator.canPop(context)) Navigator.pop(context);
-      Tools.showToast(context, "操作失败: ${e.toString()}");
+      closeLoading();
+      if (mounted) Tools.showToast(context, "操作失败: ${e.toString()}");
     }
   }
 
-  static Future<QccPacket> _signTransactionTask(Map<String, String> data) async {
-    return await QccDataProtocol.encodeTransaction(
-      payloadJson: data['payloadJson']!,
+  /// 子线程签名 —— 与 QccTransferPage._signTransactionTask 同一写法：
+  /// 对 tx.toSign() 单独签名并覆盖 packet.signature。
+  static Future<QccPacket> _signTransactionTask(Map<String, dynamic> data) async {
+    final QccTransactionData tx = data['tx'];
+    final Uint8List sig = QccLibOqsSigner.sign(data['privHex'], tx.toSign());
+    final QccPacket qp = await QccDataProtocol.encodeTransaction(
+      payloadJson: jsonEncode(tx.toJson()),
       privateKeyHex: data['privHex']!,
       publicKeyHex: data['pubHex']!,
     );
+    qp.signature = hex.encode(sig);
+    return qp;
   }
 }

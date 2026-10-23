@@ -82,6 +82,7 @@ class QccSettingPage extends StatelessWidget {
                   );
                 },
               ),
+
               const Divider(height: 1),
               // 3. 钱包导入：移动端支持"扫码 + 文件"两种；Mac/Win 摄像头对准二维码体验差，只保留文件导入
               // 注：这里不需要手动刷新首页钱包缓存 —— WalletInitPage 在 push 本设置页时
@@ -153,5 +154,5 @@ class SettingTile extends StatelessWidget {
 /// 发版脚本/CI 会自动生成版本号文件，把这个文件换成那边生成的即可，只要保留
 /// `AppVersion.version` 这个静态字段名，调用方(QccSettingPage.dart)不用改。
 class AppVersion {
-  static const String version = "0.8.2";
+  static const String version = "0.8.3";
 }

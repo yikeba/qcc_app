@@ -150,7 +150,7 @@ class _Entry {
 
 final List<_Entry> _entries = [
 
-  _Entry(
+/*  _Entry(
     title: "单签转账",
     hint: "普通转账",
     desc: "挂出兑换单并锁定卖出资产, 等待对手方碰撞成交。",
@@ -158,7 +158,7 @@ final List<_Entry> _entries = [
     icon: Icons.swap_horiz_rounded,
     color: _P.indigo,
     // builder: (_) => DexOrderPage(),
-  ),
+  ),*/
   _Entry(
     title: "多签转账",
     hint: "原生与代币",

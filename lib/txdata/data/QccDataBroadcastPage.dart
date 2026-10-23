@@ -1,14 +1,14 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:pointycastle/digests/sha3.dart';
 import 'package:qcc_flutter/utile/LogObj.dart';
-// 【绝对路径，见文件末尾改动说明】this file 本身全是相对导入，但我不知道
-// 它在项目里的确切深度到 home/，所以这一行沿用了本 session 多次核实过的
-// package: 绝对路径，而不是硬猜相对 ../ 层数——Dart 允许同一个文件里混用
-// 相对/绝对 import，不影响编译。
 import 'package:qcc_flutter/home/QccExplorerService.dart';
+import 'package:qcc_flutter/home/QccQueryService.dart';
+
 import '../../../procotol/EntityData.dart';
 import '../../../procotol/QccPacket.dart';
 import '../../../procotol/QccDataProtocol.dart';
@@ -21,11 +21,13 @@ import 'package:http/http.dart' as http;
 import 'package:file_picker/file_picker.dart'; // 导入插件
 import 'package:image_picker/image_picker.dart';
 
+import '../../home/QccTxStatusService.dart';
 import '../../views/setting/AppTranslator.dart';
 import '../../views/setting/QccPassDialog.dart';
 import '../../views/toolviews/QccLoading.dart';
 import 'EntityDataFileStorage.dart';
 import 'EntityDataRecordsPage.dart';
+import 'EntityDataTxConfirmDialog.dart';
 
 class QccDataBroadcastPage extends StatefulWidget {
   final QccWallet? initialWallet; // 接收传入的钱包
@@ -43,37 +45,49 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
   String _fileName = "";
 
   int _currentByteSize = 0;
+  /// 即将上链的 payload 的 SHA3-256（小写 hex）。空串表示当前无内容。
+  /// 这个值必须由**实际要发送的字节**算出，不能由 String 再编码一次。
+  String _payloadSha3 = "";
   String _localHash = "";
-  double _gasFee = 0.0;
+  double _gasFee = 0.0; // 本地公式估算值（即时，不依赖网络）
   int _shards = 1;
 
-  // ---- 本轮新增：可选择发布地址 + 实时 Gas 费率 ----
   List<QccWallet> _localWallets = [];
   Map<String, String> _walletNames = {};
 
-  Map<String, dynamic>? _gasRateData; // 能解析成 Map 就存这里，供通用展示
-  String? _gasRateRaw; // 解析不出结构就存原始文本，方便你核对真实字段名
+  // ---- 费率总览：/v1/query/gas.quote（不带参数）----
+  GasQuote? _gasRule; // 链上规则总览；null 表示尚未取到，按创世默认值说明
   bool _isLoadingGasRate = false;
+  bool _gasCardExpanded = false;
+  bool _showRawRule = false;
   String? _gasRateError;
 
-  // 🐛 FIX：拿到 GasRuleObj.java 源码后核实——单包上限是 256KB
-  // (`public long dataMaxSize = 1024 * 256;`)，不是之前按 "EntityData.java
-  // 里 MAX_PAYLOAD_SIZE" 猜测/核对出来的 1MB。这是本次唯一确认要改的数字，
-  // 已经把下面所有用到"1MB上限"的地方(拦截判断+提示文案)都换掉了。
-  //
-  // 【顺带做的加强】dataMaxSize 这个字段挂在 GasRuleObj 上，本身是
-  // governable=true 的规则对象——理论上未来可能被治理调整，不一定永远是
-  // 256KB。所以这里没有简单写死 256*1024 就完事，而是优先用
-  // _loadGasRate() 实时查到的 dataMaxSize(如果 /v1/gasRate 返回里有这个
-  // 字段)，查不到或者还没查回来时，才退回到下面这个"已知创世值"当兜底。
-  // 这样以后规则真的被治理调整了，App 不用等下一次版本发布就能跟上。
-  static const int _fallbackMaxPayloadSize = 1024 * 256; // 256KB，GasRuleObj 创世默认值
-  static const double _fallbackGFactor = 1.0; // GasRuleObj.gFactor 创世默认值
+  // ---- 按字节报价：/v1/query/gas.quote?byteSize=N ----
+  // 服务端报价才是扣费权威；本地公式只用于输入时即时显示。
+  // 输入时防抖 + 序号丢弃过期响应，避免每敲一个字都打一次执行层。
+  Timer? _quoteDebounce;
+  int _quoteSeq = 0;
+  double? _serverGas;
+  int _serverQuoteBytes = -1; // _serverGas 对应的字节数，与 _currentByteSize 不一致即视为过期
+  bool _isQuoting = false;
+  String? _quoteError;
 
-  int? _liveMaxPayloadSize; // 从 /v1/gasRate 实时查到的 dataMaxSize，查不到时为 null
-  double? _liveGFactor; // 从 /v1/gasRate 实时查到的 gFactor，查不到时为 null
+  // GasRuleObj 创世默认值，链上查不到时兜底
+  static const int _fallbackMaxPayloadSize = 1024 * 256; // 256KB
+  static const double _fallbackGFactor = 1.0;
+
+  int? _liveMaxPayloadSize;
+  double? _liveGFactor;
 
   int get _maxPayloadSize => _liveMaxPayloadSize ?? _fallbackMaxPayloadSize;
+
+  bool get _gasIsServer => _serverGas != null && _serverQuoteBytes == _currentByteSize;
+  double get _displayGas => _gasIsServer ? _serverGas! : _gasFee;
+
+  /// 服务端报价与本地公式不一致 —— 通常意味着 gas.quote 字段名/单位假设错了，
+  /// 或者链上规则已被治理调整而本地公式没跟上。
+  bool get _gasMismatch =>
+      _gasIsServer && _gasFee >= 0 && (_serverGas! - _gasFee).abs() > 1e-9;
 
   @override
   void initState() {
@@ -85,8 +99,16 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     _loadGasRate();
   }
 
-  /// 加载本机全部单签钱包，供"发布方地址"下拉选择；如果外部没有传入
-  /// initialWallet，就回退到当前激活钱包/本机第一个钱包。
+  @override
+  void dispose() {
+    _quoteDebounce?.cancel();
+    _textController.removeListener(_updateMetricsFromText);
+    _textController.dispose();
+    _tagController.dispose();
+    _tabController.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadLocalWallets() async {
     final names = await QccStorage.getAllWalletNames();
     final wallets = QccObj.readWallets();
@@ -103,22 +125,8 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     });
   }
 
-  /// 实时查询 QCC 公链 Gas 费率——对应 GasRateContext.java 的
-  /// GET /v1/gasRate（不带任何参数，全局唯一一份费率快照）。
-  ///
-  /// 【假设，需要你确认】GasRateContext.java 源码本身没有展示
-  /// @WebServlet 的 URL 映射，这里按同一批查询接口(PledgeContext ->
-  /// /v1/pledge/{address})的命名习惯猜的路径，如果实际不是 /v1/gasRate，
-  /// 告诉我改一下就行。
-  ///
-  /// 【本轮更新】上一版这里"不敢猜字段名去乘算总费用"，现在拿到了
-  /// GasRuleObj.java 源码——它没有用 @JSONField 改名，fastjson2 默认
-  /// 序列化会直接用 Java 字段名当 JSON key，所以这里认为 data 字段解析出来
-  /// 的 Map 里应该能直接按 "gFactor"、"dataMaxSize" 这两个字面量键名取值。
-  /// 如果实际返回的 JSON 结构不是"GasRuleObj 整个对象"（比如只返回了算好
-  /// 的费率数字，或者字段被包了一层），下面这段解析会静默拿不到值、自动
-  /// 退回创世默认值，不会报错，但费用/上限就会跟真实规则脱节，建议你拿到
-  /// 真实返回后告诉我核对一下。
+  /// 费率总览：GET /v1/query/gas.quote（QueryContext → 执行层）。
+  /// 取 gFactor / dataMaxSize 供本地即时估算与上限拦截。
   Future<void> _loadGasRate() async {
     if (mounted) {
       setState(() {
@@ -127,67 +135,78 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
       });
     }
     try {
-      final resp = await http.get(Uri.parse("${QccExplorerService.baseUrl}/v1/gasRate"));
-      final outer = jsonDecode(resp.body);
-      Map<String, dynamic>? parsedMap;
-      String? rawText;
-
-      if (outer is Map && outer['ok'] == true) {
-        final data = outer['data'];
-        if (data is String) {
-          try {
-            final inner = jsonDecode(data);
-            if (inner is Map) {
-              parsedMap = Map<String, dynamic>.from(inner);
-              rawText = const JsonEncoder.withIndent('  ').convert(inner);
-            } else {
-              rawText = data;
-            }
-          } catch (_) {
-            rawText = data;
-          }
-        } else if (data is Map) {
-          parsedMap = Map<String, dynamic>.from(data);
-          rawText = const JsonEncoder.withIndent('  ').convert(data);
-        } else {
-          rawText = data?.toString();
-        }
-      } else {
-        if (!mounted) return;
-        setState(() {
-          _gasRateError = "查询失败: ${resp.body}";
-          _isLoadingGasRate = false;
-        });
-        return;
-      }
-
-      // 🐛 FIX：从查到的 Map 里提取 gFactor / dataMaxSize，供
-      // _calculateDataGas() / _maxPayloadSize 使用；取不到就保持 null，
-      // 用类里定义的创世默认值兜底，不影响页面正常使用。
-      double? liveG;
-      int? liveMax;
-      if (parsedMap != null) {
-        final gf = parsedMap['gFactor'];
-        if (gf is num && gf > 0) liveG = gf.toDouble();
-        final dm = parsedMap['dataMaxSize'];
-        if (dm is num && dm > 0) liveMax = dm.toInt();
-      }
-
+      final q = await QccQueryService.gasQuoteOverview();
       if (!mounted) return;
       setState(() {
-        _gasRateData = parsedMap;
-        _gasRateRaw = rawText;
+        _gasRule = q;
         _isLoadingGasRate = false;
-        _liveGFactor = liveG;
-        _liveMaxPayloadSize = liveMax;
+        _liveGFactor = (q.gFactor != null && q.gFactor! > 0) ? q.gFactor : null;
+        _liveMaxPayloadSize = (q.dataMaxSize != null && q.dataMaxSize! > 0) ? q.dataMaxSize : null;
       });
-      // 上限/费率可能在用户已经选好文件之后才查回来，重新算一次避免显示滞后。
-      _updateMetrics(_currentByteSize);
+      // 上限/费率可能在用户已经选好内容之后才查回来，重算一次
+      _updateMetrics(_currentByteSize, raw: _currentPayloadBytes());
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _gasRateError = "查询异常: $e";
+        _gasRateError = "查询失败: $e";
         _isLoadingGasRate = false;
+      });
+    }
+  }
+
+  /// 当前标签页实际要发送的字节，用于重算 hash。
+  Uint8List? _currentPayloadBytes() {
+    if (_tabController.index == 0) {
+      return Uint8List.fromList(utf8.encode(_textController.text));
+    }
+    return _selectedFileBytes;
+  }
+
+  void _scheduleServerQuote(int byteSize) {
+    _quoteDebounce?.cancel();
+    if (byteSize <= 0 || byteSize > _maxPayloadSize) {
+      _quoteSeq++; // 作废在途请求
+      if (_serverGas != null || _quoteError != null || _isQuoting) {
+        setState(() {
+          _serverGas = null;
+          _serverQuoteBytes = -1;
+          _quoteError = null;
+          _isQuoting = false;
+        });
+      }
+      return;
+    }
+    _quoteDebounce = Timer(const Duration(milliseconds: 400), () => _fetchServerQuote(byteSize));
+  }
+
+  Future<void> _fetchServerQuote(int byteSize) async {
+    final int seq = ++_quoteSeq;
+    if (mounted) setState(() { _isQuoting = true; _quoteError = null; });
+    try {
+      final q = await QccQueryService.gasQuoteBytes(byteSize);
+      if (!mounted || seq != _quoteSeq) return;
+      setState(() {
+        _isQuoting = false;
+        if (q.rejected) {
+          _serverGas = null;
+          _serverQuoteBytes = -1;
+          _quoteError = q.reason ?? "链上判定 byteSize 越界";
+        } else if (q.gas == null) {
+          _serverGas = null;
+          _serverQuoteBytes = -1;
+          _quoteError = "gas.quote 返回中无 quote.gasQcc";
+        } else {
+          _serverGas = q.gas;
+          _serverQuoteBytes = byteSize;
+        }
+      });
+    } catch (e) {
+      if (!mounted || seq != _quoteSeq) return;
+      setState(() {
+        _isQuoting = false;
+        _serverGas = null;
+        _serverQuoteBytes = -1;
+        _quoteError = "$e";
       });
     }
   }
@@ -235,41 +254,24 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     );
   }
 
-  // 核心逻辑：实时计算字节、是否超限和 Gas。
-  // 🐛 FIX：上限改用 _maxPayloadSize（256KB 创世值，或 /v1/gasRate 查到的
-  // 实时 dataMaxSize），不再用 EntityData.maxPayloadSize（之前核对成
-  // 1MB，跟 GasRuleObj.java 里的 256KB 对不上——这次以 GasRuleObj 为准，
-  // 如果 EntityData.dart 里那个常量也确实写的是 1MB，麻烦你那边也一并
-  // 改一下源头，不然别处如果还引用了那个常量，还是会用错值）。
-  //
-  // "_shards"这个字段名是历史遗留——EntityData.java 里完全没有任何
-  // 分片/多包上链的逻辑，SendDataTest.java 也是整包一次性 POST，所以这里
-  // 只保留"是否超过单包上限"的语义(超限时 _shards>1，仅用于禁用提交按钮
-  // 和提示，不代表真的会分片发送)。
-  void _updateMetrics(int byteSize) {
+  /// 实时计算字节、是否超限、本地 Gas 估算，并触发服务端报价（防抖）。
+  void _updateMetrics(int byteSize, {Uint8List? raw}) {
     setState(() {
       _currentByteSize = byteSize;
       _shards = byteSize > _maxPayloadSize ? 2 : (byteSize > 0 ? 1 : 0);
       _gasFee = _calculateDataGas(byteSize);
+      _payloadSha3 = (raw == null || raw.isEmpty) ? "" : qccSha3Hex(raw);
     });
+    _scheduleServerQuote(byteSize);
   }
 
-  /// 🐛 FIX：原来是"1KB=0.001 QCC"的占位线性公式，未核实过真实计费规则。
-  /// 现在拿到 GasRuleObj.java 源码了，这里逐行照抄它的 calculateDataGas()：
-  ///   - 超过上限(或负数)直接判无效，返回 -1
-  ///   - 按 1KB 向上取整计费
-  ///   - <=10KB：每 KB 0.001 QCC
-  ///   - <=24KB：固定 0.015 QCC（"普惠商业区"，不再逐 KB 累加）
-  ///   - >24KB：0.015 + 超出部分每 KB 0.1 QCC（资源收费区，涨得很快——
-  ///     256KB 满额大概是 23 QCC 左右，量级远高于普通转账的 0.001 QCC，
-  ///     这也是下面你问的"存证费用很高"这句话的真实数字依据）
-  /// 全部再乘以 gFactor（治理棘轮系数，优先用实时查到的值，查不到用创世
-  /// 默认值 1.0 兜底）。
+  /// 本地即时估算 —— 逐行照抄 GasRuleObj.calculateDataGas()。
+  /// 仅用于输入时即时显示；扣费以 gas.quote 服务端报价为准。
   double _calculateDataGas(int byteSize) {
     final maxSize = _maxPayloadSize;
     if (byteSize < 0 || byteSize > maxSize) return -1;
     final gFactor = _liveGFactor ?? _fallbackGFactor;
-    final kb = (byteSize + 1023) ~/ 1024; // 向上取整到 KB，对应 Java (byteSize+1023L)/1024L
+    final kb = (byteSize + 1023) ~/ 1024;
     if (kb <= 10) return kb * 0.001 * gFactor;
     if (kb <= 24) return 0.015 * gFactor;
     final extraKb = kb - 24;
@@ -277,8 +279,9 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
   }
 
   void _updateMetricsFromText() {
-    final bytes = utf8.encode(_textController.text);
-    _updateMetrics(bytes.length);
+    // 必须用未经 trim 的原文，与 _handleTextPublish 送出去的字节完全一致
+    final bytes = Uint8List.fromList(utf8.encode(_textController.text));
+    _updateMetrics(bytes.length, raw: bytes);
   }
 
   @override
@@ -291,8 +294,6 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
         backgroundColor: Colors.white,
         elevation: 0.5,
         actions: [
-          // 【本次新增入口】"明细中心"——查看本机全部存证发布记录，
-          // 对应你这次的要求"增加一个明细中心来显示发布信息明细"。
           IconButton(
             tooltip: Tools.getTra("发布明细"),
             icon: const Icon(Icons.receipt_long, color: Colors.black87),
@@ -309,6 +310,11 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
           labelColor: Colors.blue.shade800,
           unselectedLabelColor: Colors.grey,
           indicatorColor: Colors.blue.shade800,
+          // 切换标签后字节/hash/报价要跟着当前标签的内容走
+          onTap: (_) {
+            final b = _currentPayloadBytes();
+            _updateMetrics(b?.length ?? 0, raw: b);
+          },
           tabs: [
             Tab(text: Tools.getTra("文本存证")),
             Tab(text: Tools.getTra("文件存证")),
@@ -334,10 +340,6 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     );
   }
 
-  /// 发布方地址卡片——本轮改造：从"只读展示"改成"可点击切换"，本机有
-  /// 多个钱包时点一下弹出选择列表(_pickPublisherAddress())，同时把该
-  /// 地址的 QCC 余额直接摆出来，方便发布前一眼看出够不够付这笔(偏贵的)
-  /// 存证 Gas。
   Widget _buildPublisherCard() {
     final String? nick = _currentWallet == null ? null : _walletNames[_currentWallet!.address];
     final bool canSwitch = _localWallets.length > 1;
@@ -394,10 +396,48 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     );
   }
 
-  /// 实时 Gas 费率卡片——对应新增的 GasRateContext.java 查询接口。
-  /// 展示服务端返回的原始费率结构(能解析出 Map 就逐个 key 展示，解析不出来
-  /// 就展示原始文本)，同时下面的"预估 Gas"已经改用 GasRuleObj 真实公式。
+  /// QCC 金额的展示格式：最多 6 位小数，去掉末尾的 0。
+  /// 0.001 * gFactor 这类 double 运算会产生 0.0010000000000000002，必须格式化后再展示。
+  String _fmtQcc(double v) {
+    var s = v.toStringAsFixed(6);
+    if (s.contains('.')) {
+      s = s.replaceFirst(RegExp(r'0+$'), '');
+      if (s.endsWith('.')) s = s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
+  /// 说明当前内容落在哪一档、需要付多少费用。没有内容时返回 null。
+  String? _currentFeeSentence() {
+    final n = _currentByteSize;
+    if (n <= 0) return null;
+    if (n > _maxPayloadSize) {
+      return "当前内容 ${(n / 1024).toStringAsFixed(1)} KB，超过单笔上限 ${_maxPayloadSize ~/ 1024} KB，无法发布。";
+    }
+    final kb = (n + 1023) ~/ 1024;
+    final tier = kb <= 10 ? "小数据档" : (kb <= 24 ? "一口价档" : "按量加价档");
+    final src = _gasIsServer ? "链上报价" : "本地估算";
+    return "当前内容按 $kb KB 计费，属于$tier，需支付 ${_fmtQcc(_displayGas)} QCC（$src）。";
+  }
+
+  /// 存证计费说明卡片。
+  ///
+  /// 价格由 gFactor 和 dataMaxSize 按 GasRuleObj.calculateDataGas() 的同一公式
+  /// 现场算出，不读取 dataTiers 里的描述字符串：一是那些字符串存在 double 拼接
+  /// 产生的尾数问题，二是 tier() 的字段名我没看到。
+  /// 卡片默认折叠成一行，避免压缩下方的输入区；点击后展开完整说明。
   Widget _buildGasRateCard() {
+    final double g = _gasRule?.gFactor ?? _liveGFactor ?? _fallbackGFactor;
+    final int maxKb = _maxPayloadSize ~/ 1024;
+    final double fullFee = _calculateDataGas(_maxPayloadSize);
+    final String? current = _currentFeeSentence();
+    final String summary = current ??
+        "按数据大小收费：10 KB 内每 KB ${_fmtQcc(0.001 * g)} QCC，"
+            "11–24 KB 一口价 ${_fmtQcc(0.015 * g)} QCC，更大按 KB 加价。";
+
+    const TextStyle body = TextStyle(fontSize: 12, color: Colors.black87, height: 1.5);
+    const TextStyle note = TextStyle(fontSize: 11, color: Colors.black54, height: 1.4);
+
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -410,43 +450,84 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.local_gas_station_outlined, size: 18, color: Colors.orange),
-              const SizedBox(width: 8),
-              Expanded(child: Trans("实时 Gas 费率", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.deepOrange))),
-              IconButton(
-                iconSize: 18,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                icon: _isLoadingGasRate
-                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.refresh, color: Colors.deepOrange),
-                onPressed: _isLoadingGasRate ? null : _loadGasRate,
-              ),
-            ],
+          InkWell(
+            onTap: () => setState(() => _gasCardExpanded = !_gasCardExpanded),
+            child: Row(
+              children: [
+                const Icon(Icons.local_gas_station_outlined, size: 18, color: Colors.orange),
+                const SizedBox(width: 8),
+                Expanded(child: Trans("存证计费说明", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.deepOrange))),
+                Icon(_gasCardExpanded ? Icons.expand_less : Icons.expand_more, size: 18, color: Colors.deepOrange),
+                const SizedBox(width: 8),
+                IconButton(
+                  iconSize: 18,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  icon: _isLoadingGasRate
+                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.refresh, color: Colors.deepOrange),
+                  onPressed: _isLoadingGasRate ? null : _loadGasRate,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            summary,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: current != null ? FontWeight.bold : FontWeight.normal,
+              color: (current != null && _currentByteSize > _maxPayloadSize) ? Colors.red : Colors.black87,
+            ),
           ),
           if (_gasRateError != null)
             Padding(
               padding: const EdgeInsets.only(top: 4),
-              child: Text(_gasRateError!, style: const TextStyle(fontSize: 11, color: Colors.red)),
-            )
-          else if (_gasRateData != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Wrap(
-                spacing: 12,
-                runSpacing: 4,
-                children: _gasRateData!.entries
-                    .map((e) => Text("${e.key}: ${e.value}", style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.black87)))
-                    .toList(),
+              child: Text("$_gasRateError（以下按创世默认规则说明）", style: const TextStyle(fontSize: 11, color: Colors.red)),
+            ),
+          if (_gasCardExpanded) ...[
+            const Divider(height: 14),
+            const Text("存证按数据大小收费，不足 1 KB 按 1 KB 计：", style: body),
+            Text("• 10 KB 以内：每 KB ${_fmtQcc(0.001 * g)} QCC，10 KB 共 ${_fmtQcc(0.01 * g)} QCC", style: body),
+            Text("• 11–24 KB：一口价 ${_fmtQcc(0.015 * g)} QCC，不再按 KB 累加", style: body),
+            Text(
+              "• 24 KB 以上：${_fmtQcc(0.015 * g)} QCC 起，超出部分每 KB 加 ${_fmtQcc(0.1 * g)} QCC"
+                  "${fullFee >= 0 ? "；$maxKb KB 满额为 ${_fmtQcc(fullFee)} QCC" : ""}",
+              style: body,
+            ),
+            const SizedBox(height: 6),
+            Text("单笔存证最大 $maxKb KB，超过会被链上拒绝。", style: note),
+            Text(
+              g == 1.0
+                  ? "当前价格系数为 1，即创世标准价。"
+                  : "当前治理价格系数为 ×${_fmtQcc(g)}，以上价格已乘以该系数。",
+              style: note,
+            ),
+            if (_gasRule?.ruleGasQcc != null)
+              Text("作为对比，一笔普通转账的手续费为 ${_fmtQcc(_gasRule!.ruleGasQcc!)} QCC。", style: note),
+            Text(
+              _gasRule != null ? "以上规则来自链上实时查询，扣费以链上为准。" : "尚未取到链上规则，以上为创世默认值。",
+              style: note,
+            ),
+            if (_gasRule != null) ...[
+              const SizedBox(height: 4),
+              InkWell(
+                onTap: () => setState(() => _showRawRule = !_showRawRule),
+                child: Text(
+                  _showRawRule ? "收起原始返回" : "查看原始返回",
+                  style: const TextStyle(fontSize: 11, color: Colors.blue, decoration: TextDecoration.underline),
+                ),
               ),
-            )
-          else if (_gasRateRaw != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Text(_gasRateRaw!, style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.black54)),
-              ),
+              if (_showRawRule)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: SelectableText(
+                    const JsonEncoder.withIndent('  ').convert(_gasRule!.raw),
+                    style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.black54),
+                  ),
+                ),
+            ],
+          ],
         ],
       ),
     );
@@ -505,27 +586,20 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                // 【已定稿】图片上传保留（不移除相册入口）。256KB 限制前端先拦
-                // （见 _maxPayloadSize / _calculateDataGas，超限直接禁用发布按钮），
-                // 公链端 GasRuleObj.calculateDataGas() 对超过 dataMaxSize 的字节数
-                // 本身也会返回 -1 兜底，前后端双重限制，不是只有前端一道拦截。
                 _quickActionButton(Icons.photo_library, "相册图片", () => _handlePickMedia(ImageSource.gallery)),
                 _quickActionButton(Icons.insert_drive_file, "本地文件", _pickFile),
               ],
             ),
             const SizedBox(height: 15),
-            // 🐛 FIX：原来写死"1MB"，现在跟着 _maxPayloadSize 动态显示
-            // (256KB 创世值，或治理调整后查到的实时值)。
             Trans("支持 ${(_maxPayloadSize / 1024).toStringAsFixed(0)}KB 以内的图片、PDF 或文档", style: const TextStyle(fontSize: 10, color: Colors.grey)),
           ],
         )
-            : _buildSelectedFilePreview(), // 选中后的预览状态
+            : _buildSelectedFilePreview(),
       ),
     );
   }
 
   Widget _buildSelectedFilePreview() {
-    // 判断是否为图片（根据文件名后缀或字节头，这里简单用后缀判断）
     bool isImage = _fileName.toLowerCase().endsWith('.jpg') ||
         _fileName.toLowerCase().endsWith('.jpeg') ||
         _fileName.toLowerCase().endsWith('.png') ||
@@ -534,20 +608,22 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // 1. 顶部文件状态头
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text("已就绪载荷", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue)),
             InkWell(
-              onTap: () => setState(() { _selectedFileBytes = null; _fileName = ""; _currentByteSize = 0; }),
+              // 原来只把 _currentByteSize 置 0，Gas/hash/报价不会跟着清掉
+              onTap: () {
+                setState(() { _selectedFileBytes = null; _fileName = ""; });
+                _updateMetrics(0);
+              },
               child: const Icon(Icons.cancel, color: Colors.redAccent, size: 20),
             ),
           ],
         ),
         const SizedBox(height: 15),
 
-        // 2. 预览区域
         Container(
           width: double.infinity,
           height: 160,
@@ -561,7 +637,7 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
             borderRadius: BorderRadius.circular(12),
             child: Image.memory(
               _selectedFileBytes!,
-              fit: BoxFit.contain, // 保持比例预览图片
+              fit: BoxFit.contain,
             ),
           )
               : Column(
@@ -576,19 +652,24 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
 
         const SizedBox(height: 15),
 
-        // 3. 文件元数据
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(color: Colors.blue.shade50, borderRadius: BorderRadius.circular(8)),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text("字节大小 (Raw Bytes)", style: TextStyle(fontSize: 10, color: Colors.grey)),
-                  Text("${(_currentByteSize / 1024).toStringAsFixed(2)} KB", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("字节大小 (Raw Bytes)", style: TextStyle(fontSize: 10, color: Colors.grey)),
+                    Text("$_currentByteSize bytes  (${(_currentByteSize / 1024).toStringAsFixed(2)} KB)",
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    const SizedBox(height: 2),
+                    Text("SHA3-256  ${_payloadSha3.isEmpty ? "—" : _payloadSha3}",
+                        style: const TextStyle(fontFamily: 'monospace', fontSize: 9, color: Colors.black54)),
+                  ],
+                ),
               ),
               const Icon(Icons.check_circle, color: Colors.blue, size: 24),
             ],
@@ -597,19 +678,18 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
 
         const SizedBox(height: 15),
 
-        // 4. 操作按钮：允许更换或者直接执行上链流程中的"喂养"
         Row(
           children: [
             Expanded(
               child: OutlinedButton(
-                onPressed: _pickFile, // 重新选择文件
+                onPressed: _pickFile,
                 child: Trans("更换文件"),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: ElevatedButton(
-                onPressed: _onFinalSubmit, // 直接触发之前的解耦发送流程
+                onPressed: _onFinalSubmit,
                 child: Trans("立即上链"),
               ),
             ),
@@ -631,6 +711,7 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
       ),
     );
   }
+
   Widget _buildTagInput() {
     return Row(
       children: [
@@ -656,7 +737,7 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     try {
       final XFile? media = await _picker.pickImage(
         source: source,
-        imageQuality: 70, // 自动轻微压缩，更容易控制在上限内
+        imageQuality: 70,
       );
 
       if (media != null) {
@@ -669,7 +750,7 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
           _selectedFileBytes = bytes;
           _fileName = media.name;
         });
-        _updateMetrics(bytes.length);
+        _updateMetrics(bytes.length, raw: bytes);
       }
     } catch (e) {
       LogObj.log("媒体选择错误: $e");
@@ -678,6 +759,9 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
 
   // --- 底部核心控制面板 ---
   Widget _buildBottomControlPanel() {
+    final String gasLabel = _gasIsServer ? "Gas (链上报价)" : "Gas (本地估算)";
+    final String gasValue = _displayGas < 0 ? "—" : "${_displayGas.toStringAsFixed(4)} QCC";
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: const BoxDecoration(
@@ -691,15 +775,35 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                _statusItem("大小", "${(_currentByteSize / 1024).toStringAsFixed(2)} KB"),
+                _statusItem("大小", "$_currentByteSize B"),
                 _statusItem("分片", "$_shards"),
-                // 🐛 FIX：不再是占位公式——已接入 GasRuleObj.calculateDataGas()
-                // 的真实计费公式（乘以实时/兜底 gFactor）。_gasFee 为 -1 时
-                // (理论上不该出现，因为按钮已经在超限时被禁用)显示"—"。
-                _statusItem("预估 Gas", _gasFee < 0 ? "—" : "${_gasFee.toStringAsFixed(4)} QCC"),
+                _statusItem(gasLabel, gasValue, trailing: _isQuoting
+                    ? const Padding(
+                  padding: EdgeInsets.only(left: 4),
+                  child: SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5)),
+                )
+                    : null),
               ],
             ),
-            const SizedBox(height: 20),
+            if (_gasMismatch)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  "⚠️ 链上报价 ${_serverGas!.toStringAsFixed(4)} 与本地公式 ${_gasFee.toStringAsFixed(4)} 不一致，以链上为准",
+                  style: const TextStyle(fontSize: 10, color: Colors.orange),
+                ),
+              )
+            else if (_quoteError != null && _currentByteSize > 0)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  "链上报价失败，当前显示本地估算：$_quoteError",
+                  style: const TextStyle(fontSize: 10, color: Colors.redAccent),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
               height: 50,
@@ -708,9 +812,6 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
                   backgroundColor: Colors.black87,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
-                // 【修复，本轮沿用】原来只判断 _currentByteSize>0，超过上限
-                // 也能点提交，一路弹密码框/loading后才在 toBytes() 里抛异常
-                // ——现在提前在按钮上就拦住，且上限已改成 _maxPayloadSize。
                 onPressed: (_currentByteSize > 0 && _currentByteSize <= _maxPayloadSize) ? _onFinalSubmit : null,
                 child: Trans("签名并广播至全球节点", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               ),
@@ -721,12 +822,18 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     );
   }
 
-  Widget _statusItem(String label, String value) {
+  Widget _statusItem(String label, String value, {Widget? trailing}) {
     return Column(
       children: [
         Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
         const SizedBox(height: 4),
-        Text(value, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.blueAccent)),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(value, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.blueAccent)),
+            if (trailing != null) trailing,
+          ],
+        ),
       ],
     );
   }
@@ -735,23 +842,21 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.any,
-        withData: true, // 关键：直接读取字节到内存，适合小文件
+        withData: true,
       );
 
       if (result != null && result.files.single.bytes != null) {
         PlatformFile file = result.files.single;
 
-        // 🐛 FIX：检查大小限制改用 _maxPayloadSize（256KB，对应
-        // GasRuleObj.java 的 dataMaxSize，之前错核对成了 EntityData 的 1MB）。
         if (file.size > _maxPayloadSize) {
           Tools.showToast(context, "文件大小超过 ${_maxPayloadSize ~/ 1024}KB 限制");
           return;
         }
         setState(() {
-          _selectedFileBytes = file.bytes; // 拿到 Uint8List
+          _selectedFileBytes = file.bytes;
           _fileName = file.name;
-          _updateMetrics(file.size); // 更新显示的字节数和 Gas
         });
+        _updateMetrics(file.bytes!.length, raw: file.bytes!);
 
         Tools.showToast(context, "已选择文件: $_fileName");
       }
@@ -760,7 +865,6 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     }
   }
 
-  // 逻辑切换入口
   void _onFinalSubmit() {
     if (_tabController.index == 0) {
       _handleTextPublish();
@@ -769,18 +873,16 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     }
   }
 
-// 文本处理逻辑
   void _handleTextPublish() {
-    String text = _textController.text.trim();
-    if (text.isEmpty) {
+    final String raw = _textController.text;
+    if (raw.trim().isEmpty) {
       Tools.showToast(context, "请输入文字内容");
       return;
     }
-    Uint8List payload = Uint8List.fromList(utf8.encode(text));
+    final Uint8List payload = Uint8List.fromList(utf8.encode(raw));
     _performPublish(payload);
   }
 
-// 文件处理逻辑
   void _handleFilePublish() {
     if (_selectedFileBytes == null) {
       Tools.showToast(context, "请先选择一个文件(<${_maxPayloadSize ~/ 1024}KB)");
@@ -789,30 +891,104 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     _performPublish(_selectedFileBytes!);
   }
 
+  /// 发布前确认：真实字节 + 链上按字节报价的费用。
+  Future<bool?> _confirmPayload(Uint8List sendata, GasQuote? quote, String? quoteErr) {
+    final String hex = qccSha3Hex(sendata);
+    final int n = sendata.length;
+    String edge(Iterable<int> b) => b.join(',');
+    final String head = edge(sendata.take(16));
+    final String tail = edge(sendata.skip(n > 16 ? n - 16 : 0));
+
+    final double local = _calculateDataGas(n);
+    final bool hasServer = quote?.gas != null;
+    final String feeText = hasServer
+        ? "${quote!.gas!.toStringAsFixed(4)} QCC（链上报价）"
+        : "${local.toStringAsFixed(4)} QCC（本地估算）";
+
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("确认上链内容", style: TextStyle(fontSize: 16)),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text("字节数  $n", style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text("Gas 费用  $feeText", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.deepOrange)),
+              if (hasServer && quote!.tier != null)
+                Text("计费档位  ${quote.tier}  (${quote.kb ?? '-'} KB)",
+                    style: const TextStyle(fontSize: 11, color: Colors.black54)),
+              if (!hasServer && quoteErr != null)
+                Text("链上报价失败：$quoteErr", style: const TextStyle(fontSize: 10, color: Colors.redAccent)),
+              if (hasServer && local >= 0 && (quote!.gas! - local).abs() > 1e-9)
+                Text("本地公式为 ${local.toStringAsFixed(4)} QCC，与链上不一致，扣费以链上为准",
+                    style: const TextStyle(fontSize: 10, color: Colors.orange)),
+              const SizedBox(height: 8),
+              const Text("SHA3-256", style: TextStyle(fontSize: 11, color: Colors.grey)),
+              SelectableText(hex, style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+              const SizedBox(height: 10),
+              const Text("首 16 字节", style: TextStyle(fontSize: 11, color: Colors.grey)),
+              Text(head, style: const TextStyle(fontFamily: 'monospace', fontSize: 10)),
+              const SizedBox(height: 6),
+              const Text("末 16 字节", style: TextStyle(fontSize: 11, color: Colors.grey)),
+              Text(tail, style: const TextStyle(fontFamily: 'monospace', fontSize: 10)),
+              const SizedBox(height: 10),
+              const Text(
+                "上链的就是这些字节,不会再做任何裁剪或转换。请与本地文件核对后再继续。",
+                style: TextStyle(fontSize: 11, color: Colors.black54),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: hex));
+              Tools.showToast(context, "已复制 SHA3-256");
+            },
+            child: const Text("复制 hash"),
+          ),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text("取消")),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text("确认上链")),
+        ],
+      ),
+    );
+  }
+
   void _performPublish(Uint8List sendata) async {
-    // 【提前拦截，回应"十万次"批量场景】超过协议上限就不要再弹密码框/走
-    // 完整流程了，否则会一路走到 toBytes() 里才抛异常，浪费一次密码交互。
-    // 🐛 FIX：上限改用 _maxPayloadSize。
     if (sendata.length > _maxPayloadSize) {
       Tools.showToast(context, "数据大小超过 ${_maxPayloadSize ~/ 1024}KB 上限，无法发布");
       return;
     }
 
-    // 1. 获取输入内容并校验
+    // ---- 0a. 按真实字节数向执行层取一次权威报价 ----
+    // 不复用防抖缓存：提交时的字节数必须与报价字节数严格一致。
+    GasQuote? quote;
+    String? quoteErr;
+    try {
+      quote = await QccQueryService.gasQuoteBytes(sendata.length);
+    } catch (e) {
+      quoteErr = "$e";
+    }
+    if (!mounted) return;
+    if (quote != null && quote.rejected) {
+      Tools.showToast(context, "链上拒绝：${quote.reason ?? '超过 dataMaxSize'}");
+      return;
+    }
+
+    // ---- 0b. 发布前字节 + 费用核对 ----
+    final bool? go = await _confirmPayload(sendata, quote, quoteErr);
+    if (go != true) return;
+
     final activeWallet = _currentWallet ?? QccObj.activeWallet;
     if (activeWallet == null) return;
-    // 2. 验证支付密码
     String? password = await QccPassDialog.show(context);
     if (password == null) return;
-    // 3. 启动通用 Loading
     final statusNotifier = ValueNotifier<TxStep>(TxStep.restoring);
     QccLoading.show(context, statusNotifier);
 
-    // 【修复，之前这段 try/catch 整体被注释掉】任何一步(钱包恢复失败/
-    // 密码错误/签名异常/网络异常)抛出，loading 都必须被关掉一次，否则会
-    // 永久卡死——这是本 session 里 QccTxFlow.run() 专门解决过的同一类问题，
-    // 这个页面走的是二进制 octet-stream 提交(不是 QccTxFlow.run() 假设的
-    // JSON POST)，没法直接复用它，所以在这里单独补上同样的 try/catch。
     try {
       // ---- A. 还原钱包 ----
       QccWallet? wallet = await QccStorage.restoreWallet(context, activeWallet.address, password);
@@ -825,18 +1001,11 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
       EntityData eData = EntityData();
       eData.from = wallet.address;
       eData.assetId = "QCCData";
-      // 【待你确认，见我这次回复正文】开发者推广地址 fromdev——
-      // EntityData.java 里这个字段会参与 id 与签名计算，SendDataTest.java
-      // 里取的是 demoUtil.fromdev，但目前这个 Flutter App 里没有告诉我
-      // 它应该来自哪里(固定值/构建配置/当前钱包的推广关系...)，暂时留空
-      // (null)，这是协议允许的合法取值(getPayloadForHash() 里 null 按
-      // 空字符串处理)，不影响签名/验签的正确性，只是发布时不会带上任何
-      // 推广归属信息。
-      eData.fromdev = null;
+      eData.fromdev = "QQxDj4tZrVA77PA3U1wW91kcmMigkcj5HN";
       eData.timestamp = DateTime.now().millisecondsSinceEpoch;
       eData.payload = sendata;
 
-      // ---- C. 签名 + 编码（协议层统一处理，含子isolate耗时计算）----
+      // ---- C. 签名 + 编码 ----
       statusNotifier.value = TxStep.signing;
       final QccPacket packet = await QccDataProtocol.encodeEntityData(
         data: eData,
@@ -844,11 +1013,11 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
         publicKeyHex: wallet.pubkey!,
       );
 
-      // ---- D. 构建整个 Packet 的二进制流并提交 ----
+      // ---- D. 提交 ----
       statusNotifier.value = TxStep.submitting;
       Uint8List binaryData = packet.toBytes();
 
-      String url = "https://tx.qccio.com/v1/data";
+      String url = "${QccExplorerService.baseUrl}/v1/data";
       final response = await http.post(
         Uri.parse(url),
         headers: {"Content-Type": "application/octet-stream"},
@@ -859,10 +1028,6 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
       if (response.statusCode == 200) {
         LogObj.log("发布成功，返回内容:${response.body},返回错误${response.statusCode}");
 
-        // 【本次新增】服务端 200 不等于业务成功——真正的业务结果在
-        // response.body 里的 status 字段("ACCEPTED"才是真成功，参考你
-        // 贴的真实返回)，这里先解析出来，txHash 也从这里取，而不是
-        // 自己在本地算一个(id 计算规则以服务端回显为准更保险)。
         Map<String, dynamic>? resData;
         try {
           final dynamic decoded = jsonDecode(response.body);
@@ -870,12 +1035,13 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
         } catch (_) {
           resData = null;
         }
-        final String status = (resData?['status'] ?? '').toString();
+        // 服务端返回格式：{"status":"accepted","code":"ACCEPTED","txHash":..,"msg":..}
+        // status 是小写、code 是大写。原来用 status=="ACCEPTED" 判断永远不成立，
+        // 每次都走 else 分支，既不落记录也不弹哈希。现在以 code 为准，兼容 status。
+        final String acceptCode = (resData?['code'] ?? resData?['status'] ?? '').toString().toUpperCase();
         final String? txHash = resData?['txHash']?.toString();
         final String serverMsg = (resData?['msg'] ?? '').toString();
 
-        // 【在清空输入框之前】先把这次发布的摘要信息取出来，
-        // 否则 preview/fileName 在 setState 清空后就取不到了。
         final bool isFileMode = _tabController.index != 0;
         String preview;
         if (isFileMode) {
@@ -889,8 +1055,7 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
           }
         }
 
-        if (status == "ACCEPTED" && txHash != null && txHash.isNotEmpty) {
-          // ---- 本机落一条发布记录 ----
+        if (acceptCode == "ACCEPTED" && txHash != null && txHash.isNotEmpty) {
           await EntityDataFileStorage.saveTask({
             "txHash": txHash,
             "from": eData.from,
@@ -901,18 +1066,22 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
             "fileName": isFileMode ? _fileName : "",
             "preview": preview,
             "payloadSize": sendata.length,
-            "status": status,
+            // 发布时看到的费用：链上报价优先，否则本地估算；gasSource 标明来源
+            "gas": quote?.gas ?? _calculateDataGas(sendata.length),
+            "gasSource": quote?.gas != null ? "chain" : "local",
+            // 受理 ≠ 上链：先记为 pending，轮询出结果后改为 confirmed/failed
+            "status": "pending",
+            "acceptCode": acceptCode,
             "serverMsg": serverMsg,
             "savedAt": DateTime.now().millisecondsSinceEpoch,
           });
 
           if (mounted) {
-            _showPublishSuccessDialog(txHash: txHash, serverMsg: serverMsg, size: sendata.length);
+            _showTxConfirmDialog(txHash: txHash, serverMsg: serverMsg, size: sendata.length);
           }
         } else {
-          // 状态码 200 但业务状态不是 ACCEPTED（理论上不该出现，兜底处理，
-          // 不弹哈希弹窗，避免把一个还没确认成功的哈希当成"已发布"记下来）。
-          Tools.showToast(context, serverMsg.isNotEmpty ? "⚠️ $serverMsg" : "✅ 可信数据发布成功");
+          // 200 但未受理：不能提示"成功"
+          Tools.showToast(context, "⚠️ 未被受理${serverMsg.isNotEmpty ? "：$serverMsg" : ""}");
         }
 
         _textController.clear();
@@ -932,70 +1101,36 @@ class _QccDataBroadcastPageState extends State<QccDataBroadcastPage> with Single
     }
   }
 
-  /// 发布成功弹窗——显著展示 txHash + 一键复制，
-  /// 对应你的原话:"需要增加一个发布成功弹出显示hash"。
-  void _showPublishSuccessDialog({
+  /// 受理后的上链确认弹窗：轮询 /v1/hash/{txHash}，出结果后写回本机记录。
+  void _showTxConfirmDialog({
     required String txHash,
     required String serverMsg,
     required int size,
   }) {
     showDialog(
       context: context,
-      builder: (dialogCtx) {
-        return AlertDialog(
-          title: const Row(
-            children: [
-              Icon(Icons.check_circle, color: Colors.green),
-              SizedBox(width: 8),
-              Text("存证数据发布成功"),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("交易哈希 (txHash)：", style: TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              Container(
-                width: double.maxFinite,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.grey.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: SelectableText(
-                  txHash,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text("数据大小：${(size / 1024).toStringAsFixed(2)} KB"),
-              if (serverMsg.isNotEmpty) ...[
-                const SizedBox(height: 4),
-                Text("服务端消息：$serverMsg"),
-              ],
-              const SizedBox(height: 4),
-              const Text(
-                "该记录已保存到本机发布记录中。",
-                style: TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Clipboard.setData(ClipboardData(text: txHash));
-                Tools.showToast(context, "已复制 txHash");
-              },
-              child: const Text("复制哈希"),
-            ),
-            TextButton(
-              onPressed: () => Navigator.of(dialogCtx).pop(),
-              child: const Text("确定"),
-            ),
-          ],
-        );
-      },
+      barrierDismissible: false, // 只能点"关闭"退出，避免误触打断轮询
+      builder: (_) => EntityDataTxConfirmDialog(
+        txHash: txHash,
+        size: size,
+        serverMsg: serverMsg,
+        onFinal: (st) => EntityDataFileStorage.saveTask(QccTxStatusService.toRecordPatch(txHash, st)),
+      ),
     );
   }
+}
+
+/// SHA3-256 → 小写 hex。
+/// 【假设，需要你确认】用的是 pointycastle 的 SHA3Digest(256)。如果项目里
+/// 已有自己的 SHA3 实现，改成调用那一个 —— 全项目只应有一个 SHA3-256 实现。
+String qccSha3Hex(Uint8List data) {
+  final d = SHA3Digest(256);
+  final out = Uint8List(32);
+  d.update(data, 0, data.length);
+  d.doFinal(out, 0);
+  final sb = StringBuffer();
+  for (final b in out) {
+    sb.write(b.toRadixString(16).padLeft(2, '0'));
+  }
+  return sb.toString();
 }

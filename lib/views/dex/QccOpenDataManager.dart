@@ -7,37 +7,74 @@ import '../../utile/QccStorage.dart';
 import '../../home/QccExplorerService.dart';
 import '../../procotol/QccMatchLogic.dart';
 import 'package:qcc_flutter/utile/QccHttp.dart';
+import 'package:qcc_flutter/home/QccTxStatusService.dart';
 
 class QccOpenDataManager {
   // 内存缓存：Map<交易哈希, 交易详情Map>
   static final Map<String, Map<String, dynamic>> _orderCache = {};
   static final ValueNotifier<int> marketUpdateNotifier = ValueNotifier(0);
 
-  // ✅ 你的极简思路变体：本地刚刚发生、尚未被网络确认的扣款金额
-  static final Map<String, double> _localPendingDeductions = {};
+  /// 本地乐观扣减：openHash -> { 扣减键 -> 扣减量 }。
+  ///
+  /// 原来是"Win 受理后固定 10 秒释放"，等于假设 10 秒内一定上链——
+  /// 现在 Win 也是"受理 → 轮询上链"，10 秒内没上链时，扣减先被释放，
+  /// 盘口数量会弹回原值，用户以为没买到而重复下单；Win 上链失败时，
+  /// 扣减却要白白挂满 10 秒。
+  /// 改为按 Win 交易自己的链上结果释放：
+  ///   - 上链确认：先从服务器重新同步该 Open 单，再释放扣减（避免先弹回再下降）
+  ///   - 上链失败：立即释放，数量恢复
+  ///   - 3 分钟仍无结果：兜底释放，交由服务器数据接管
+  /// 每笔 Win 单独记一个键，同一 Open 单上多笔 Win 互不覆盖。
+  ///
+  /// 【单位约定，需要你确认】扣减量必须与 _orderCache 里的 amount 同单位，
+  /// 即 openhash 返回的 currentAmount（链上最小单位），不是界面显示的人类可读数量。
+  static final Map<String, Map<String, double>> _localPendingDeductions = {};
   static List<String> errhash=[];
 
-// ✅ Win 成功后调用这个方法记账，并自带 10 秒倒计时销毁
-  static void addLocalDeduction(String hash, double amount) {
-    // 1. 累加本地记账
-    _localPendingDeductions[hash] = (_localPendingDeductions[hash] ?? 0.0) + amount;
-    LogObj.log("乐观更新：本地记录 [$hash] 扣除 $amount");
+  static double _pendingFor(String hash) =>
+      _localPendingDeductions[hash]?.values.fold<double>(0.0, (a, b) => a + b) ?? 0.0;
 
-    // 2. ✅ 设置 10 秒延迟清理 (TTL)
-    Future.delayed(const Duration(seconds: 10), () {
-      if (_localPendingDeductions.containsKey(hash)) {
-        // 10秒后，认为量子链节点已经绝对打包完毕，删除本地记账
-        _localPendingDeductions.remove(hash);
-        LogObj.log("乐观更新过期：释放 [$hash] 的本地记账，交由服务器接管");
+  static void _releaseDeduction(String hash, String key) {
+    final m = _localPendingDeductions[hash];
+    if (m == null) return;
+    m.remove(key);
+    if (m.isEmpty) _localPendingDeductions.remove(hash);
+    marketUpdateNotifier.value++;
+  }
 
-        // 3. (可选) 触发一次静默的单条 Hash 刷新，强行用服务器最新状态覆盖本地缓存
-        _syncSingleOrder(hash).then((_) {
-          // 如果你的架构需要通知 UI 刷新，可以在这里触发
-          // 比如你在上一轮如果用了 ValueNotifier，这里可以 value++
-        });
+  /// Win 受理后调用。[winTxHash] 传入 Win 交易的 txHash 时按其链上结果释放；
+  /// 不传则退回原来的 10 秒 TTL（兼容尚未改造的调用方）。
+  static void addLocalDeduction(String hash, double amount, {String? winTxHash}) {
+    final String key = winTxHash ?? "ttl_${DateTime.now().microsecondsSinceEpoch}";
+    (_localPendingDeductions[hash] ??= {})[key] = amount;
+    marketUpdateNotifier.value++;
+    LogObj.log("乐观更新：本地记录 [$hash] 扣除 $amount（${winTxHash == null ? 'TTL 10s' : '跟随 Win $winTxHash'}）");
+
+    if (winTxHash == null) {
+      Future.delayed(const Duration(seconds: 10), () async {
+        await _syncSingleOrder(hash);
+        _releaseDeduction(hash, key);
+      });
+      return;
+    }
+
+    // 跟随 Win 交易的链上结果释放
+    TxChainStatus? last;
+    QccTxStatusService.poll(winTxHash).listen((st) {
+      last = st;
+    }, onDone: () async {
+      if (last?.state == TxChainState.failed) {
+        LogObj.log("Win [$winTxHash] 上链失败，恢复 [$hash] 本地扣减");
+        _releaseDeduction(hash, key);
+        return;
       }
+      // 确认或超时：先同步服务器最新数量，再释放本地扣减
+      await _syncSingleOrder(hash);
+      _releaseDeduction(hash, key);
+      LogObj.log("Win [$winTxHash] ${last?.state == TxChainState.confirmed ? '已上链' : '轮询超时'}，[$hash] 交由服务器数据接管");
     });
   }
+
   // 全局同步方法
   static Future<void> syncFromNetwork() async {
     try {
@@ -54,9 +91,9 @@ class QccOpenDataManager {
       _orderCache.removeWhere((hash, data) => !serverHashes.contains(hash));
       //清理已经失败的或交易完成hash
       // ✅ 修正 1：防止内存泄漏！如果服务器终于把这个废弃的 Hash 删了，黑名单也跟着释放
-     // errhash.removeWhere((hash) => !serverHashes.contains(hash));
+      // errhash.removeWhere((hash) => !serverHashes.contains(hash));
       // 2. 双重保险：将黑名单中的 Hash 从展示缓存中彻底清除
-    //  _orderCache.removeWhere((hash, data) => errhash.contains(hash));
+      //  _orderCache.removeWhere((hash, data) => errhash.contains(hash));
       // 3. 构建并发同步任务
       List<Future<void> Function()> tasks = [];
       for (String hash in serverHashes) {
@@ -112,7 +149,7 @@ class QccOpenDataManager {
           double currentAmt = (stateData['currentAmount'] as num?)?.toDouble() ?? 0.0;
           if (stateData['state'] != 'ACTIVE' || stateData['isExpired'] == true || currentAmt <= 0) {
             _orderCache.remove(hash);
-          //  LogObj.log("订单 [$hash] 已无效(金额:$currentAmt,状态:${stateData['state']})，执行清理");
+            //  LogObj.log("订单 [$hash] 已无效(金额:$currentAmt,状态:${stateData['state']})，执行清理");
             errhash.add(hash);
             return;
           }
@@ -136,21 +173,16 @@ class QccOpenDataManager {
   }
 
   static List<Map<String, dynamic>> getOrdersByType(QccMatchType type) {
-    return _orderCache.values.where((tx) {
-      String hash = tx['id'];
-
-      // 1. 获取网络上真实的数量
-      double amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-
-      // ✅ 2. 减去我们本地刚刚买走的数量 (这就是你黑名单逻辑的精髓)
-      double pendingDeduct = _localPendingDeductions[hash] ?? 0.0;
-      double finalAmt = amt - pendingDeduct;
-
+    // 🐛 原来把"扣减后的数量"写回 _orderCache[hash]['amount']，而下一次调用
+    // 又从这个已扣过的值再扣一次——每次 build 都重复扣减，数量越刷越少。
+    // 现在缓存只保存服务器数量，扣减只作用在返回给 UI 的副本上。
+    return _orderCache.values.map((tx) {
+      final String hash = tx['id'];
+      final double amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+      return <String, dynamic>{...tx, 'amount': amt - _pendingFor(hash)};
+    }).where((tx) {
       // 如果减完之后没了，就不显示了
-      if (finalAmt <= 0) return false;
-
-      // ⚠️ 把扣减后的数量塞回去给 UI 显示
-      tx['amount'] = finalAmt;
+      if (((tx['amount'] as num?)?.toDouble() ?? 0.0) <= 0) return false;
 
       // 3. 原有的类型过滤逻辑
       String rule = "";
@@ -314,8 +346,12 @@ class QccOpenDataManager {
         String pairAsset = matchLogic['pairAssetId'] ?? "";
         double chainRate = (matchLogic['rate'] as num?)?.toDouble() ?? 0.0;
         double amount = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-
         if (chainRate <= 0 || lockedAsset.isEmpty || pairAsset.isEmpty) continue;
+        // 🐛 原来没有精度换算，行情页 Vol 显示的是链上最小单位（QCC 放大 10^9 倍）；
+        // 同时扣掉本地待确认的 Win，和挂单列表口径一致
+        amount = QccAssetService().getHumanAmountNum(
+            lockedAsset, amount - _pendingFor(tx['id']?.toString() ?? ""));
+        if (amount <= 0) continue;
 
         // 识别买卖关系（锁定 USD 的是买单，锁定代币的是卖单）
         bool isBuy = lockedAsset.toUpperCase().contains("USDS");
