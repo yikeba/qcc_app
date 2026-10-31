@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/qcc.png" width="120" alt="QCC"></p>
+
 # qcc_app — QCC Flutter 客户端
 
 > QCC（Quantum Container Chain）官方开源客户端。基于 Flutter，使用 **ML-DSA-87（FIPS 204）** 后量子签名，一套代码覆盖 Android / iOS / macOS / Windows / Linux。
@@ -110,7 +112,12 @@ Windows 平台**不能依赖 pub 的本地拉取**，需要开发者自行下载
 
 ## 相关链接
 
-- QCC 白皮书：[中文](QCC_FULL_CN.md) · [English](QCC_FULL_EN.md)
+| 文档 | 中文 | English |
+|---|---|---|
+| 白皮书（全版） | [QCC_FULL_CN.md](assets/qcc/QCC_FULL_CN.md) | [QCC_FULL_EN.md](assets/qcc/QCC_FULL_EN.md) |
+| 简约版 | [QCC_MINI_CN.md](assets/qcc/QCC_MINI_CN.md) | [QCC_MINI_EN.md](assets/qcc/QCC_MINI_EN.md) |
+| 演示稿 | [qcc_ppt.html](assets/qcc/qcc_ppt.html)（下载后用浏览器打开） | |
+
 - 测试网浏览器：https://test.qccio.com
 
 ## License

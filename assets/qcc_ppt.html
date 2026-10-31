@@ -1,0 +1,1237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QCC - Quantum Container Chain</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@300;400;700&display=swap');
+
+  :root {
+    --black: #030608;
+    --deep: #060d14;
+    --navy: #0a1628;
+    --blue: #0d4f8c;
+    --cyan: #00c8ff;
+    --gold: #f0b429;
+    --gold-dim: #a07820;
+    --white: #e8f4ff;
+    --gray: #4a6080;
+    --glass: rgba(13, 79, 140, 0.12);
+    --glass-border: rgba(0, 200, 255, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--black);
+    color: var(--white);
+    font-family: 'Noto Sans SC', sans-serif;
+    overflow-x: hidden;
+  }
+
+  /* ── STARFIELD ── */
+  #stars {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background: radial-gradient(ellipse at 20% 50%, #0a1628 0%, #030608 70%);
+  }
+  #stars::before, #stars::after {
+    content: '';
+    position: absolute; inset: 0;
+    background-image:
+      radial-gradient(1px 1px at 10% 15%, rgba(0,200,255,0.6) 0%, transparent 100%),
+      radial-gradient(1px 1px at 30% 40%, rgba(255,255,255,0.4) 0%, transparent 100%),
+      radial-gradient(1px 1px at 50% 10%, rgba(0,200,255,0.4) 0%, transparent 100%),
+      radial-gradient(1px 1px at 70% 60%, rgba(255,255,255,0.3) 0%, transparent 100%),
+      radial-gradient(1px 1px at 85% 25%, rgba(0,200,255,0.5) 0%, transparent 100%),
+      radial-gradient(1px 1px at 20% 80%, rgba(255,255,255,0.3) 0%, transparent 100%),
+      radial-gradient(1px 1px at 60% 85%, rgba(0,200,255,0.4) 0%, transparent 100%),
+      radial-gradient(1px 1px at 90% 70%, rgba(255,255,255,0.5) 0%, transparent 100%),
+      radial-gradient(1px 1px at 45% 55%, rgba(240,180,41,0.3) 0%, transparent 100%),
+      radial-gradient(1px 1px at 75% 35%, rgba(255,255,255,0.4) 0%, transparent 100%);
+    background-size: 400px 400px;
+    animation: drift 60s linear infinite;
+  }
+  #stars::after { animation-duration: 90s; animation-direction: reverse; opacity: 0.6; }
+  @keyframes drift { from { transform: translateY(0); } to { transform: translateY(-400px); } }
+
+  /* ── LAYOUT ── */
+  section {
+    position: relative; z-index: 1;
+    min-height: 100vh;
+    padding: 100px 60px;
+    display: flex; flex-direction: column; justify-content: center;
+    border-bottom: 1px solid rgba(0,200,255,0.08);
+  }
+
+  .section-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    margin-bottom: 16px;
+    opacity: 0.7;
+  }
+
+  h1, h2 {
+    font-family: 'Orbitron', sans-serif;
+    letter-spacing: 2px;
+  }
+
+  /* ── NAV ── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 60px;
+    background: rgba(3,6,8,0.85);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--glass-border);
+  }
+  .nav-logo {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 22px;
+    font-weight: 900;
+    color: var(--cyan);
+    letter-spacing: 4px;
+  }
+  .nav-logo span { color: var(--gold); }
+  .nav-links { display: flex; gap: 36px; }
+  .nav-links a {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 2px;
+    color: var(--gray);
+    text-decoration: none;
+    transition: color 0.3s;
+  }
+  .nav-links a:hover { color: var(--cyan); }
+  .nav-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 6px 14px;
+    border: 1px solid var(--gold);
+    color: var(--gold);
+    letter-spacing: 2px;
+  }
+
+  /* ── HERO ── */
+  #hero {
+    min-height: 100vh;
+    padding: 160px 60px 100px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 80px;
+    align-items: center;
+  }
+  .hero-eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 5px;
+    color: var(--gold);
+    margin-bottom: 24px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .hero-eyebrow::before {
+    content: '';
+    width: 40px; height: 1px;
+    background: var(--gold);
+  }
+  .hero-title {
+    font-size: clamp(42px, 5vw, 72px);
+    line-height: 1.05;
+    margin-bottom: 12px;
+    background: linear-gradient(135deg, #ffffff 0%, var(--cyan) 60%, var(--blue) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .hero-subtitle {
+    font-family: 'Orbitron', sans-serif;
+    font-size: clamp(14px, 2vw, 20px);
+    color: var(--gold);
+    letter-spacing: 6px;
+    margin-bottom: 32px;
+  }
+  .hero-desc {
+    font-size: 16px;
+    line-height: 1.8;
+    color: rgba(232,244,255,0.65);
+    margin-bottom: 48px;
+    max-width: 520px;
+  }
+  .hero-btns { display: flex; gap: 16px; flex-wrap: wrap; }
+  .btn-primary {
+    padding: 14px 36px;
+    background: linear-gradient(135deg, var(--cyan), var(--blue));
+    color: var(--black);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-decoration: none;
+    clip-path: polygon(8px 0%, 100% 0%, calc(100% - 8px) 100%, 0% 100%);
+    transition: opacity 0.3s;
+  }
+  .btn-primary:hover { opacity: 0.85; }
+  .btn-secondary {
+    padding: 14px 36px;
+    border: 1px solid var(--glass-border);
+    color: var(--cyan);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    letter-spacing: 3px;
+    text-decoration: none;
+    clip-path: polygon(8px 0%, 100% 0%, calc(100% - 8px) 100%, 0% 100%);
+    transition: background 0.3s;
+  }
+  .btn-secondary:hover { background: var(--glass); }
+
+  /* hero visual */
+  .hero-visual {
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .hex-container {
+    position: relative;
+    width: 380px; height: 380px;
+  }
+  .hex-ring {
+    position: absolute; inset: 0;
+    border-radius: 50%;
+    border: 1px solid;
+    animation: spin linear infinite;
+  }
+  .hex-ring:nth-child(1) {
+    border-color: rgba(0,200,255,0.3);
+    animation-duration: 20s;
+  }
+  .hex-ring:nth-child(2) {
+    inset: 30px;
+    border-color: rgba(240,180,41,0.2);
+    animation-duration: 30s;
+    animation-direction: reverse;
+  }
+  .hex-ring:nth-child(3) {
+    inset: 60px;
+    border-color: rgba(0,200,255,0.15);
+    animation-duration: 15s;
+  }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .hex-core {
+    position: absolute;
+    inset: 100px;
+    background: radial-gradient(circle, rgba(0,200,255,0.15) 0%, transparent 70%);
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column;
+  }
+  .hex-core-text {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    font-weight: 900;
+    color: var(--cyan);
+    text-shadow: 0 0 30px rgba(0,200,255,0.8);
+  }
+  .hex-core-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--gold);
+    letter-spacing: 3px;
+    margin-top: 6px;
+  }
+  .orbit-dot {
+    position: absolute;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 12px var(--cyan);
+  }
+
+  /* hero stats */
+  .hero-stats {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--glass-border);
+    margin-top: 60px;
+    grid-column: 1 / -1;
+  }
+  .stat-item {
+    background: rgba(3,6,8,0.9);
+    padding: 24px 28px;
+    border-top: 2px solid transparent;
+    transition: border-color 0.3s;
+  }
+  .stat-item:hover { border-color: var(--cyan); }
+  .stat-num {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    color: var(--cyan);
+    margin-bottom: 6px;
+  }
+  .stat-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gray);
+    letter-spacing: 2px;
+  }
+
+  /* ── CARDS ── */
+  .card-grid {
+    display: grid;
+    gap: 2px;
+    background: var(--glass-border);
+    margin-top: 60px;
+  }
+  .card-grid-2 { grid-template-columns: 1fr 1fr; }
+  .card-grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .card-grid-4 { grid-template-columns: repeat(4, 1fr); }
+
+  .card {
+    background: var(--deep);
+    padding: 36px 32px;
+    position: relative;
+    overflow: hidden;
+    transition: background 0.3s;
+  }
+  .card:hover { background: rgba(10,22,40,0.95); }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .card:hover::before { opacity: 1; }
+  .card-icon {
+    font-size: 28px;
+    margin-bottom: 16px;
+    display: block;
+  }
+  .card-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    color: var(--cyan);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+  }
+  .card-body {
+    font-size: 14px;
+    line-height: 1.7;
+    color: rgba(232,244,255,0.6);
+  }
+  .card-tag {
+    display: inline-block;
+    margin-top: 16px;
+    padding: 4px 10px;
+    background: rgba(0,200,255,0.1);
+    border: 1px solid rgba(0,200,255,0.2);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--cyan);
+    letter-spacing: 1px;
+  }
+
+  /* ── SECTION HEADERS ── */
+  .section-header {
+    margin-bottom: 60px;
+    max-width: 700px;
+  }
+  .section-header h2 {
+    font-size: clamp(28px, 4vw, 48px);
+    line-height: 1.1;
+    margin-bottom: 16px;
+  }
+  .section-header p {
+    font-size: 16px;
+    line-height: 1.8;
+    color: rgba(232,244,255,0.55);
+  }
+  .cyan { color: var(--cyan); }
+  .gold { color: var(--gold); }
+
+  /* ── WHAT IS QCC ── */
+  #what .big-feature {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    background: var(--glass-border);
+    margin-bottom: 2px;
+  }
+  .feature-main {
+    background: var(--deep);
+    padding: 48px;
+    grid-column: span 1;
+  }
+  .feature-main.wide {
+    grid-column: span 2;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 48px;
+    align-items: center;
+  }
+  .tech-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border: 1px solid var(--gold);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gold);
+    letter-spacing: 2px;
+    margin-bottom: 20px;
+  }
+  .tech-tag::before {
+    content: '◆';
+    font-size: 8px;
+  }
+  .feature-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 22px;
+    color: var(--white);
+    margin-bottom: 16px;
+    line-height: 1.3;
+  }
+  .feature-desc {
+    font-size: 15px;
+    line-height: 1.8;
+    color: rgba(232,244,255,0.6);
+  }
+
+  /* OS comparison table */
+  .os-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 60px;
+    font-size: 13px;
+  }
+  .os-table th {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    padding: 16px 20px;
+    text-align: left;
+    border-bottom: 1px solid var(--glass-border);
+    color: var(--gray);
+  }
+  .os-table th:nth-child(2) { color: var(--cyan); }
+  .os-table th:nth-child(3) { color: var(--gold); }
+  .os-table td {
+    padding: 14px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    color: rgba(232,244,255,0.65);
+    line-height: 1.5;
+  }
+  .os-table td:nth-child(2) { color: rgba(0,200,255,0.85); }
+  .os-table td:nth-child(3) { color: rgba(240,180,41,0.85); }
+  .os-table tr:hover td { background: rgba(0,200,255,0.03); }
+
+  /* ── SECURITY ── */
+  #security .security-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 2px;
+    background: var(--glass-border);
+    margin-top: 60px;
+  }
+  .security-card {
+    background: var(--deep);
+    padding: 40px;
+    position: relative;
+    overflow: hidden;
+  }
+  .security-card::after {
+    content: '';
+    position: absolute;
+    bottom: 0; right: 0;
+    width: 120px; height: 120px;
+    background: radial-gradient(circle, rgba(0,200,255,0.06) 0%, transparent 70%);
+  }
+  .sec-num {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 64px;
+    color: rgba(0,200,255,0.08);
+    font-weight: 900;
+    position: absolute;
+    top: 20px; right: 24px;
+    line-height: 1;
+  }
+  .sec-icon { font-size: 32px; margin-bottom: 20px; display: block; }
+  .sec-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 15px;
+    color: var(--cyan);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+  }
+  .sec-desc {
+    font-size: 14px;
+    line-height: 1.75;
+    color: rgba(232,244,255,0.6);
+    margin-bottom: 20px;
+  }
+  .sec-detail {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gold);
+    letter-spacing: 1px;
+    padding: 8px 12px;
+    background: rgba(240,180,41,0.08);
+    border-left: 2px solid var(--gold);
+  }
+
+  /* ── ROADMAP ── */
+  #roadmap .roadmap-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 2px;
+    background: var(--glass-border);
+    margin-top: 60px;
+  }
+  .roadmap-card {
+    background: var(--deep);
+    padding: 36px;
+  }
+  .phase-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--black);
+    background: var(--cyan);
+    padding: 4px 12px;
+    display: inline-block;
+    margin-bottom: 20px;
+  }
+  .phase-badge.gold-bg { background: var(--gold); }
+  .phase-badge.blue-bg { background: var(--blue); color: var(--cyan); }
+  .roadmap-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 14px;
+    color: var(--white);
+    letter-spacing: 1px;
+    margin-bottom: 20px;
+  }
+  .roadmap-items { list-style: none; }
+  .roadmap-items li {
+    font-size: 13px;
+    line-height: 1.7;
+    color: rgba(232,244,255,0.6);
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    display: flex;
+    gap: 10px;
+  }
+  .roadmap-items li::before {
+    content: '→';
+    color: var(--cyan);
+    flex-shrink: 0;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .roadmap-target {
+    margin-top: 24px;
+    padding: 14px 16px;
+    background: rgba(0,200,255,0.06);
+    border: 1px solid rgba(0,200,255,0.15);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--cyan);
+    letter-spacing: 1px;
+    line-height: 1.6;
+  }
+
+  /* ── NODES ── */
+  #nodes .node-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 2px;
+    background: var(--glass-border);
+    margin-top: 60px;
+  }
+  .node-card {
+    background: var(--deep);
+    padding: 32px 28px;
+    position: relative;
+  }
+  .node-level {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: var(--gray);
+    margin-bottom: 12px;
+  }
+  .node-name {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 14px;
+    color: var(--white);
+    margin-bottom: 8px;
+    letter-spacing: 1px;
+  }
+  .node-stake {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 22px;
+    color: var(--gold);
+    margin-bottom: 16px;
+  }
+  .node-stake span {
+    font-size: 12px;
+    color: var(--gray);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .node-features { list-style: none; }
+  .node-features li {
+    font-size: 12px;
+    color: rgba(232,244,255,0.55);
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .node-features li::before {
+    content: '◉';
+    font-size: 7px;
+    color: var(--cyan);
+  }
+  .reward-bar {
+    margin-top: 40px;
+    padding: 28px 32px;
+    background: rgba(240,180,41,0.05);
+    border: 1px solid rgba(240,180,41,0.2);
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    grid-column: 1 / -1;
+    background-color: var(--deep);
+  }
+  .reward-item { text-align: center; }
+  .reward-pct {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 36px;
+    font-weight: 900;
+    margin-bottom: 6px;
+  }
+  .reward-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gray);
+    letter-spacing: 2px;
+  }
+
+  /* ── DEVELOPER ── */
+  #developer .dev-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    background: var(--glass-border);
+    margin-top: 60px;
+  }
+  .dev-main {
+    background: var(--deep);
+    padding: 48px;
+  }
+  .dev-pool {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 56px;
+    font-weight: 900;
+    line-height: 1;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--gold), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .dev-pool-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 3px;
+    color: var(--gray);
+    margin-bottom: 32px;
+  }
+  .dev-steps { list-style: none; counter-reset: steps; }
+  .dev-steps li {
+    counter-increment: steps;
+    display: flex;
+    gap: 20px;
+    padding: 16px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    font-size: 14px;
+    color: rgba(232,244,255,0.65);
+    line-height: 1.6;
+  }
+  .dev-steps li::before {
+    content: counter(steps, decimal-leading-zero);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 20px;
+    color: rgba(0,200,255,0.3);
+    flex-shrink: 0;
+    min-width: 36px;
+  }
+  .dev-highlight {
+    background: var(--deep);
+    padding: 48px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 24px;
+  }
+  .highlight-stat {
+    padding: 24px;
+    border: 1px solid var(--glass-border);
+    position: relative;
+    overflow: hidden;
+  }
+  .highlight-stat::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--cyan);
+  }
+  .highlight-stat.gold-accent::before { background: var(--gold); }
+  .hs-num {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 32px;
+    color: var(--cyan);
+    margin-bottom: 4px;
+  }
+  .hs-num.gold { color: var(--gold); }
+  .hs-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gray);
+    letter-spacing: 2px;
+  }
+
+  /* ── FOOTER ── */
+  footer {
+    position: relative; z-index: 1;
+    padding: 60px;
+    border-top: 1px solid var(--glass-border);
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 48px;
+    background: rgba(3,6,8,0.95);
+  }
+  .footer-brand .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 24px;
+    font-weight: 900;
+    color: var(--cyan);
+    letter-spacing: 4px;
+    margin-bottom: 16px;
+  }
+  .footer-brand .logo span { color: var(--gold); }
+  .footer-brand p {
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--gray);
+    max-width: 280px;
+  }
+  .footer-col h4 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--cyan);
+    margin-bottom: 20px;
+  }
+  .footer-col a {
+    display: block;
+    font-size: 13px;
+    color: var(--gray);
+    text-decoration: none;
+    padding: 6px 0;
+    transition: color 0.3s;
+  }
+  .footer-col a:hover { color: var(--white); }
+  .footer-bottom {
+    position: relative; z-index: 1;
+    padding: 24px 60px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(3,6,8,0.98);
+  }
+  .footer-bottom p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--gray);
+    letter-spacing: 1px;
+  }
+
+  /* ── ANIMATIONS ── */
+  .fade-up {
+    opacity: 0;
+    transform: translateY(30px);
+    transition: opacity 0.7s ease, transform 0.7s ease;
+  }
+  .fade-up.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* scan line effect */
+  .scan-line {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    opacity: 0.15;
+    animation: scan 8s linear infinite;
+    z-index: 200;
+    pointer-events: none;
+  }
+  @keyframes scan {
+    from { top: 0; }
+    to { top: 100vh; }
+  }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 900px) {
+    section { padding: 80px 24px; }
+    nav { padding: 16px 24px; }
+    #hero { grid-template-columns: 1fr; padding: 120px 24px 60px; }
+    .hero-visual { display: none; }
+    .card-grid-3, .card-grid-4 { grid-template-columns: 1fr 1fr; }
+    .big-feature, .dev-grid, #security .security-grid { grid-template-columns: 1fr; }
+    .feature-main.wide { grid-template-columns: 1fr; }
+    .roadmap-grid, .node-grid { grid-template-columns: 1fr 1fr; }
+    footer { grid-template-columns: 1fr; }
+    .hero-stats { grid-template-columns: 1fr 1fr; }
+    .os-table { font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stars"></div>
+<div class="scan-line"></div>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-logo">Q<span>CC</span></div>
+  <div class="nav-links">
+    <a href="#what">架构</a>
+    <a href="#capability">能力</a>
+    <a href="#security">安全</a>
+    <a href="#roadmap">路线</a>
+    <a href="#nodes">节点</a>
+    <a href="#developer">开发者</a>
+  </div>
+  <div class="nav-badge">测试网即将上线</div>
+</nav>
+
+<!-- HERO -->
+<section id="hero">
+  <div class="hero-content fade-up">
+    <div class="hero-eyebrow">QUANTUM CONTAINER CHAIN</div>
+    <h1 class="hero-title">区块链<br>操作系统</h1>
+    <div class="hero-subtitle">POST-QUANTUM · CONTAINER · OS</div>
+    <p class="hero-desc">
+      全球首个商业化抗量子容器公链。以不可篡改为第一性原理，构建可信账本与可信数据的统一底座。
+    </p>
+    <div class="hero-btns">
+      <a href="https://github.com/qccio" class="btn-primary">GITHUB 开源</a>
+      <a href="#what" class="btn-secondary">了解架构</a>
+    </div>
+  </div>
+
+  <div class="hero-visual fade-up">
+    <div class="hex-container">
+      <div class="hex-ring"></div>
+      <div class="hex-ring"></div>
+      <div class="hex-ring"></div>
+      <div class="hex-core">
+        <div class="hex-core-text">QCC</div>
+        <div class="hex-core-sub">ML-DSA-87</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-stats fade-up">
+    <div class="stat-item">
+      <div class="stat-num">3s</div>
+      <div class="stat-label">上链确认时间</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-num">1000+</div>
+      <div class="stat-label">TPS 峰值上链</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-num">256K</div>
+      <div class="stat-label">最大实体数据上链</div>
+    </div>
+  </div>
+</section>
+
+<!-- WHAT IS QCC -->
+<section id="what">
+  <div class="section-header fade-up">
+    <div class="section-label">// 01 — QCC 是什么</div>
+    <h2>区块链 <span class="cyan">操作系统</span></h2>
+    <p>容器为进程，区块为数据边界，规则为权限。QCC 不是转账链，不是存证链，而是可信字节世界的底层操作系统。</p>
+  </div>
+
+  <div class="big-feature fade-up">
+    <div class="feature-main">
+      <div class="tech-tag">ML-DSA-87 / NIST 2024 标准</div>
+      <div class="feature-title">全球首个商业化<br>抗量子签名公链</div>
+      <p class="feature-desc">采用 NIST 2024 正式标准 ML-DSA-87（Dilithium5），Category 5 最高安全等级。在量子计算机正式威胁到来之前，QCC 已率先完成底层密钥体系的抗量子迁移。</p>
+    </div>
+    <div class="feature-main">
+      <div class="tech-tag">CONTAINER CHAIN</div>
+      <div class="feature-title">容器链结构<br>资产即边界</div>
+      <p class="feature-desc">一个容器只服务一个 assetId 资产域。USDT 容器与 QCC 容器并行运行，互不干扰。资产域隔离即并发，从架构层解决传统区块链的串行瓶颈。</p>
+    </div>
+  </div>
+
+  <div class="big-feature fade-up" style="margin-top:2px;">
+    <div class="feature-main wide">
+      <div>
+        <div class="tech-tag">RULE SYSTEM</div>
+        <div class="feature-title">链上配规则<br>不在链上写代码</div>
+        <p class="feature-desc">规则不是任意合约代码，而是系统预定义的能力单元。开发者通过规则交易在容器边界内实例化规则，无需部署合约，审计边界清晰，安全可控。</p>
+      </div>
+      <div>
+        <div class="tech-tag">DUAL CHANNEL</div>
+        <div class="feature-title">数字资产 + 数字数据<br>双通道统一账本</div>
+        <p class="feature-desc">金融交易与实体数据上链共用同一底层协议。256K 字节数据上链能力，支持合同、影像、票据原件直接写入可信账本，构建全球唯一完整区块链操作系统。</p>
+      </div>
+    </div>
+  </div>
+
+  <table class="os-table fade-up">
+    <thead>
+      <tr>
+        <th>系统维度</th>
+        <th>iOS</th>
+        <th>QCC</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>原生运行单元</td><td>App / 进程</td><td>容器 Container</td></tr>
+      <tr><td>权限模型</td><td>相机、定位等权限</td><td>冻结、增发、规则实例</td></tr>
+      <tr><td>系统隔离</td><td>App 与 App 默认隔离</td><td>容器与容器默认隔离</td></tr>
+      <tr><td>应用发布</td><td>App Store 审核</td><td>无需许可，链上交易发布</td></tr>
+      <tr><td>第一性原理</td><td>设备控制与应用安全</td><td>不可篡改，延伸可信数据</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- CAPABILITY -->
+<section id="capability">
+  <div class="section-header fade-up">
+    <div class="section-label">// 02 — QCC 能做什么</div>
+    <h2><span class="cyan">金融</span> + <span class="gold">数据</span> 双基础设施</h2>
+    <p>世界民间 NASDAQ 级去中心化交易所，与国防金融级可信数据存证，在同一条链上运行。</p>
+  </div>
+
+  <div class="card-grid card-grid-3 fade-up">
+    <div class="card">
+      <span class="card-icon">🌏</span>
+      <div class="card-title">洲际稳定币账本</div>
+      <p class="card-body">东南亚、日韩、中东跨区域稳定币支付、换汇、结算。支持多种非 USD 稳定币并行运行，自定义资产账本。</p>
+      <span class="card-tag">STABLECOIN LEDGER</span>
+    </div>
+    <div class="card">
+      <span class="card-icon">📈</span>
+      <div class="card-title">去中心化交易所</div>
+      <p class="card-body">民间 NASDAQ 级 DEX，链上内生价格发现，无外部预言机依赖。Gas 收益 70% 直接奖励矿机节点。</p>
+      <span class="card-tag">DECENTRALIZED DEX</span>
+    </div>
+    <div class="card">
+      <span class="card-icon">🔐</span>
+      <div class="card-title">可信数据存证</div>
+      <p class="card-body">AES 加密 + 多签组合，字节数据打乱上链，链下客户端解析还原。国防、金融、司法、海关级数据安全。</p>
+      <span class="card-tag">TRUSTED DATA</span>
+    </div>
+    <div class="card">
+      <span class="card-icon">🏛️</span>
+      <div class="card-title">司法 / 海关 / 税务</div>
+      <p class="card-body">政府机构级可信存证。客户独有 assetId 容器进程隔离，数据不出域，满足行政数据合规要求。</p>
+      <span class="card-tag">GOVERNMENT GRADE</span>
+    </div>
+    <div class="card">
+      <span class="card-icon">🤖</span>
+      <div class="card-title">AI 可信数据留痕</div>
+      <p class="card-body">AI 行为记录、模型训练数据来源存证。为下一代 AI 监管合规提供不可篡改的数据底座。</p>
+      <span class="card-tag">AI DATA LAYER</span>
+    </div>
+    <div class="card">
+      <span class="card-icon">🏢</span>
+      <div class="card-title">企业资产证券化</div>
+      <p class="card-body">支持透明、公开、分红企业发行实体代币。供应链金融、链上票据、产品追溯全流程上链。</p>
+      <span class="card-tag">ASSET TOKENIZATION</span>
+    </div>
+  </div>
+</section>
+
+<!-- SECURITY -->
+<section id="security">
+  <div class="section-header fade-up">
+    <div class="section-label">// 03 — QCC 安全性</div>
+    <h2>四层 <span class="cyan">安全架构</span></h2>
+    <p>从密钥底层到钱包端到端，构建完整的安全纵深防御体系。</p>
+  </div>
+
+  <div class="security-grid fade-up">
+    <div class="security-card">
+      <div class="sec-num">01</div>
+      <span class="sec-icon">⚛️</span>
+      <div class="sec-title">抗量子密钥对</div>
+      <p class="sec-desc">ML-DSA-87（Dilithium5）是 NIST 2024 年正式发布的最高安全等级后量子签名标准。对抗量子计算机 Shor 算法攻击，签名安全性不依赖当前计算能力假设。</p>
+      <div class="sec-detail">NIST CATEGORY 5 · ML-DSA-87 · SHA3-256</div>
+    </div>
+    <div class="security-card">
+      <div class="sec-num">02</div>
+      <span class="sec-icon">⚙️</span>
+      <div class="sec-title">操作系统级规则安全</div>
+      <p class="sec-desc">链上不部署任意代码，规则作为系统预定义能力在容器边界内实例化生效。规则边界清晰，审计范围可控，从根本上消除智能合约任意代码执行漏洞。</p>
+      <div class="sec-detail">规则实例化替代智能合约 · 容器边界隔离</div>
+    </div>
+    <div class="security-card">
+      <div class="sec-num">03</div>
+      <span class="sec-icon">🔑</span>
+      <div class="sec-title">24 词助记词 + 支付密码</div>
+      <p class="sec-desc">钱包采用 24 词助记词与支付密码双因素派生体系。私钥永不触网，本地派生，多签权限协同控制高价值资产，支持冷钱包物理隔离存储。</p>
+      <div class="sec-detail">24-WORD MNEMONIC · PAYMENT PASSWORD · COLD WALLET</div>
+    </div>
+    <div class="security-card">
+      <div class="sec-num">04</div>
+      <span class="sec-icon">🛡️</span>
+      <div class="sec-title">数据加密存证安全</div>
+      <p class="sec-desc">AES-256-GCM 认证加密，HMAC 双重验证，防重放攻击。实体数据上链前字节级打乱加密，链上原始字节无法还原，满足国防与金融级别数据安全标准。</p>
+      <div class="sec-detail">AES-256-GCM · HMAC-SHA256 · 防重放 · 多签还原</div>
+    </div>
+  </div>
+</section>
+
+<!-- ROADMAP -->
+<section id="roadmap">
+  <div class="section-header fade-up">
+    <div class="section-label">// 04 — 战略路线图</div>
+    <h2>三阶段 <span class="gold">全球布局</span></h2>
+    <p>从亚洲稳定币账本出发，18 个月目标 1 亿 USD 稳定币规模，逐步建立全球可信基础设施进入点。</p>
+  </div>
+
+  <div class="roadmap-grid fade-up">
+    <div class="roadmap-card">
+      <div class="phase-badge">PHASE A · 0-18M</div>
+      <div class="roadmap-title">亚洲稳定币账本</div>
+      <ul class="roadmap-items">
+        <li>东南亚 + 日韩 + 中东稳定币支付</li>
+        <li>2-4 个出/入金银行铸赎支持</li>
+        <li>50 家核心支付/汇兑机构合作</li>
+        <li>2 个以上非 USD 稳定币拓展</li>
+      </ul>
+      <div class="roadmap-target">目标：1 亿 USD 稳定币规模</div>
+    </div>
+    <div class="roadmap-card">
+      <div class="phase-badge gold-bg">PHASE B · 6-18M</div>
+      <div class="roadmap-title">去中心化交易所</div>
+      <ul class="roadmap-items">
+        <li>第一期 6M：稳定币/QCC DEX 运行</li>
+        <li>第二期 12M：10+ 代币资产上线</li>
+        <li>扶持 3+ 每月分红资产代币实体</li>
+        <li>链上内生价格，无预言机依赖</li>
+      </ul>
+      <div class="roadmap-target">目标：每月 10 万 USD 分红规模</div>
+    </div>
+    <div class="roadmap-card">
+      <div class="phase-badge blue-bg">PHASE C · 全球</div>
+      <div class="roadmap-title">代币资产证券化</div>
+      <ul class="roadmap-items">
+        <li>亚洲 4-6 个区域布局</li>
+        <li>欧洲 1-2 个进入点</li>
+        <li>全球 10 大业务中心布局</li>
+        <li>前 10 家透明分红企业推广</li>
+      </ul>
+      <div class="roadmap-target">目标：全球可信资产底座</div>
+    </div>
+  </div>
+</section>
+
+<!-- NODES -->
+<section id="nodes">
+  <div class="section-header fade-up">
+    <div class="section-label">// 05-06 — 节点矿机体系</div>
+    <h2>四级节点 <span class="cyan">Gas 激励</span></h2>
+    <p>质押参与，按等级获得 Gas 奖励分配。Gas 70% 直接奖励矿机，20% 奖励其他节点，10% 进入基金会持续运维。</p>
+  </div>
+
+  <div class="node-grid fade-up">
+    <div class="node-card" style="border-top: 2px solid var(--gold);">
+      <div class="node-level">TIER 1 · 超级节点</div>
+      <div class="node-name">Super Node</div>
+      <div class="node-stake">10万 <span>QCC</span></div>
+      <ul class="node-features">
+        <li>完整共识参与权</li>
+        <li>余额状态机</li>
+        <li>索引状态机</li>
+        <li>交易状态机</li>
+        <li>数据状态机</li>
+        <li>规则状态机</li>
+        <li>可独立运行主链</li>
+      </ul>
+    </div>
+    <div class="node-card" style="border-top: 2px solid var(--cyan);">
+      <div class="node-level">TIER 2 · 全节点</div>
+      <div class="node-name">Full Node</div>
+      <div class="node-stake">1万 <span>QCC</span></div>
+      <ul class="node-features">
+        <li>余额状态机</li>
+        <li>索引状态机</li>
+        <li>交易状态机</li>
+        <li>数据状态机</li>
+        <li>完整容器数据同步</li>
+        <li>交易矿机业务</li>
+      </ul>
+    </div>
+    <div class="node-card" style="border-top: 2px solid var(--blue);">
+      <div class="node-level">TIER 3 · 数据节点</div>
+      <div class="node-name">Data Node</div>
+      <div class="node-stake">1千 <span>QCC</span></div>
+      <ul class="node-features">
+        <li>索引状态机</li>
+        <li>数据状态机</li>
+        <li>完整容器数据同步</li>
+        <li>数据矿机业务</li>
+      </ul>
+    </div>
+    <div class="node-card" style="border-top: 2px solid var(--gray);">
+      <div class="node-level">TIER 4 · 冷存储</div>
+      <div class="node-name">Storage Node</div>
+      <div class="node-stake">-- <span>QCC</span></div>
+      <ul class="node-features">
+        <li>索引状态节点</li>
+        <li>容器冷数据存储</li>
+        <li>集群分布式方案</li>
+        <li>基金会维护支持</li>
+      </ul>
+    </div>
+
+    <div class="reward-bar">
+      <div class="reward-item">
+        <div class="reward-pct" style="color: var(--gold);">70%</div>
+        <div class="reward-label">GAS → 矿机节点</div>
+      </div>
+      <div class="reward-item">
+        <div class="reward-pct" style="color: var(--cyan);">20%</div>
+        <div class="reward-label">GAS → 其他节点</div>
+      </div>
+      <div class="reward-item">
+        <div class="reward-pct" style="color: var(--gray);">10%</div>
+        <div class="reward-label">GAS → 基金会运维</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- DEVELOPER -->
+<section id="developer">
+  <div class="section-header fade-up">
+    <div class="section-label">// 07 — 开发者奖励</div>
+    <h2>5000万 QCC <span class="gold">开发者奖励池</span></h2>
+    <p>全球第一个对开发者直接链上奖励的公链。Gas 产生即奖励，代码执行，无需人工审批。</p>
+  </div>
+
+  <div class="dev-grid fade-up">
+    <div class="dev-main">
+      <div class="dev-pool">5000万</div>
+      <div class="dev-pool-label">QCC DEVELOPER REWARD POOL</div>
+      <ol class="dev-steps">
+        <li>通过 QCC 钱包发起开发者地址申请</li>
+        <li>支付 100 QCC Gas 完成开发者认证</li>
+        <li>开发 App 提交交易/数据交易上链</li>
+        <li>系统自动按 30% Gas 比例从奖励池分配</li>
+        <li>奖励由系统共识发起，代码执行，无人工干预</li>
+      </ol>
+    </div>
+    <div class="dev-highlight">
+      <div class="highlight-stat">
+        <div class="hs-num">30%</div>
+        <div class="hs-label">GAS 奖励比例 / 每笔开发者交易</div>
+      </div>
+      <div class="highlight-stat gold-accent">
+        <div class="hs-num gold">100 QCC</div>
+        <div class="hs-label">开发者认证 GAS 费用</div>
+      </div>
+      <div class="highlight-stat">
+        <div class="hs-num" style="font-size:24px; color: var(--white);">系统共识执行</div>
+        <div class="hs-label">奖励分配 · 无人工审批 · 链上透明</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-brand">
+    <div class="logo">Q<span>CC</span></div>
+    <p>Quantum Container Chain — 面向百年的可信人类记事本。让历史从此人人可写，人人可存，人人可证。</p>
+  </div>
+  <div class="footer-col">
+    <h4>技术资源</h4>
+    <a href="https://github.com/qccio/QccWallet">GitHub · Java 钱包</a>
+    <a href="https://github.com/qccio/qcc_flutter">GitHub · Flutter App</a>
+    <a href="#">白皮书 · 中文全版</a>
+    <a href="#">白皮书 · English</a>
+  </div>
+  <div class="footer-col">
+    <h4>联系</h4>
+    <a href="mailto:fchatth@gmail.com">fchatth@gmail.com</a>
+    <a href="#">fChat · 4444444</a>
+    <a href="#">永久测试网（即将上线）</a>
+  </div>
+</footer>
+<div class="footer-bottom">
+  <p>© 2026 QCC · Quantum Container Chain · v1.0</p>
+  <p>QCC_FULL_CN.md · 2026.03</p>
+</div>
+
+<script>
+  // Intersection Observer for fade-up animations
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('.fade-up').forEach(el => observer.observe(el));
+
+  // Orbit dots
+  const hexContainer = document.querySelector('.hex-container');
+  if (hexContainer) {
+    const angles = [0, 72, 144, 216, 288];
+    angles.forEach((angle, i) => {
+      const dot = document.createElement('div');
+      dot.className = 'orbit-dot';
+      const radius = 160;
+      const rad = (angle * Math.PI) / 180;
+      dot.style.cssText = `
+        left: ${190 + radius * Math.cos(rad) - 4}px;
+        top: ${190 + radius * Math.sin(rad) - 4}px;
+        animation: orbit${i} ${8 + i * 2}s linear infinite;
+        opacity: ${0.4 + i * 0.12};
+      `;
+      hexContainer.appendChild(dot);
+
+      const style = document.createElement('style');
+      style.textContent = `
+        @keyframes orbit${i} {
+          from { transform: rotate(0deg) translateX(${radius}px) rotate(0deg); left: 186px; top: 186px; }
+          to { transform: rotate(360deg) translateX(${radius}px) rotate(-360deg); left: 186px; top: 186px; }
+        }
+      `;
+      document.head.appendChild(style);
+    });
+  }
+</script>
+</body>
+</html>
