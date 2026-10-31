@@ -64,7 +64,13 @@ class QccMimeParser {
         }
       }
 
-      return ParsedMail(isHtml: isHtml, html: body, attachments: attachments);
+      return ParsedMail(
+        isHtml: isHtml,
+        html: body,
+        attachments: attachments,
+        headers: root.headers,
+        plainText: text,
+      );
     } catch (e) {
       return ParsedMail(
           isHtml: false, html: '(解析失败: $e)', attachments: const []);
@@ -74,7 +80,9 @@ class QccMimeParser {
   // ============ MIME 实体解析 ============
   static _Entity _parseEntity(Uint8List bytes) {
     final sep = _findHeaderEnd(bytes);
-    final headerStr = latin1.decode(bytes.sublist(0, sep.headerEnd));
+    // 头部按 UTF-8 容错解码（兼容 8bit 原始中文头）；RFC2047 编码字在取值时再解
+    final headerStr =
+        utf8.decode(bytes.sublist(0, sep.headerEnd), allowMalformed: true);
     final body = bytes.sublist(sep.bodyStart);
     final headers = _parseHeaders(headerStr);
 
@@ -242,7 +250,9 @@ class QccMimeParser {
   // ============ RFC2047 头解码（文件名等用） ============
   static String decodeHeaderWord(String text) {
     if (!text.contains('=?')) return text;
-    final re = RegExp(r'=\?([\w-]+)\?([BbQq])\?(.*?)\?=');
+    // 相邻编码字之间的空白按 RFC2047 §6.2 应忽略（否则长中文主题中间会多空格）
+    text = text.replaceAll(RegExp(r'\?=\s+=\?'), '?==?');
+    final re =RegExp(r'=\?([\w-]+)\?([BbQq])\?(.*?)\?=');
     return text.replaceAllMapped(re, (m) {
       final cs = m.group(1)!.toLowerCase();
       final enc = m.group(2)!.toUpperCase();
@@ -312,7 +322,118 @@ class ParsedMail {
   final bool isHtml;
   final String html;
   final List<MailAttachment> attachments;
-  ParsedMail({required this.isHtml, required this.html, required this.attachments});
+
+  /// 顶层原始头（键已小写，值未做 RFC2047 解码）
+  final Map<String, String> headers;
+
+  /// text/plain 正文（若有），回复/转发引用时优先用它
+  final String? plainText;
+
+  ParsedMail({
+    required this.isHtml,
+    required this.html,
+    required this.attachments,
+    this.headers = const {},
+    this.plainText,
+  });
+
+  String header(String name) =>
+      QccMimeParser.decodeHeaderWord(headers[name.toLowerCase()] ?? '');
+
+  String get subject => header('subject');
+  String get messageId => (headers['message-id'] ?? '').trim();
+  String get references => (headers['references'] ?? '').trim();
+  String get dateRaw => headers['date'] ?? '';
+
+  List<MailAddr> get from => MailAddr.parseList(header('from'));
+  List<MailAddr> get to => MailAddr.parseList(header('to'));
+  List<MailAddr> get cc => MailAddr.parseList(header('cc'));
+  List<MailAddr> get replyTo => MailAddr.parseList(header('reply-to'));
+
+  /// 引用用纯文本：有 text/plain 用它，否则把 html 粗转文本
+  String get quotableText {
+    final t = plainText;
+    if (t != null && t.trim().isNotEmpty) return t;
+    if (!isHtml) return html;
+    return html
+        .replaceAll(
+            RegExp(r'<(style|script)[^>]*>.*?</\1>',
+                caseSensitive: false, dotAll: true),
+            '')
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(
+            RegExp(r'</(p|div|tr|li|h\d)>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'<[^>]+>'), '')
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&amp;', '&')
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
+  }
+}
+
+/// 邮件地址（显示名 + 地址）
+class MailAddr {
+  final String name;
+  final String email;
+  const MailAddr(this.name, this.email);
+
+  String get display => name.isEmpty ? email : name;
+
+  @override
+  String toString() => name.isEmpty ? email : '$name <$email>';
+
+  @override
+  bool operator ==(Object other) =>
+      other is MailAddr && other.email.toLowerCase() == email.toLowerCase();
+
+  @override
+  int get hashCode => email.toLowerCase().hashCode;
+
+  /// 解析单个地址："Name <a@b>" / "<a@b>" / "a@b"
+  static MailAddr? parse(String raw) {
+    final s = raw.trim();
+    if (s.isEmpty) return null;
+    final lt = s.lastIndexOf('<');
+    final gt = s.lastIndexOf('>');
+    if (lt >= 0 && gt > lt) {
+      final email = s.substring(lt + 1, gt).trim();
+      var name = s.substring(0, lt).trim();
+      if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) {
+        name = name.substring(1, name.length - 1);
+      }
+      if (!email.contains('@')) return null;
+      return MailAddr(name.replaceAll(r'\"', '"').trim(), email);
+    }
+    if (!s.contains('@')) return null;
+    return MailAddr('', s.replaceAll(RegExp(r'[\s;,<>]'), ''));
+  }
+
+  /// 解析地址列表：逗号/分号分隔，忽略引号和尖括号内的分隔符
+  static List<MailAddr> parseList(String raw) {
+    final out = <MailAddr>[];
+    final buf = StringBuffer();
+    var inQuote = false;
+    var inAngle = false;
+    for (var i = 0; i < raw.length; i++) {
+      final ch = raw[i];
+      if (ch == '"') inQuote = !inQuote;
+      if (ch == '<') inAngle = true;
+      if (ch == '>') inAngle = false;
+      if ((ch == ',' || ch == ';') && !inQuote && !inAngle) {
+        final a = parse(buf.toString());
+        if (a != null) out.add(a);
+        buf.clear();
+      } else {
+        buf.write(ch);
+      }
+    }
+    final a = parse(buf.toString());
+    if (a != null) out.add(a);
+    return out;
+  }
 }
 
 class MailAttachment {

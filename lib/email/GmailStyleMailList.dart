@@ -1,160 +1,302 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import 'MailSyncService.dart';
-import 'QccMailDetailPage.dart';
+import 'MailCenter.dart';
 
-/// Gmail 风格邮件列表。
-/// 数据源是本地索引（MailLocalStore），下拉触发差额同步。离线也能看列表。
-class GmailStyleMailList extends StatefulWidget {
-  final String user;
-  const GmailStyleMailList({super.key, required this.user});
+/// Gmail 风格邮件列表（纯展示组件，状态由 QccMailHomePage / MailCenter 管理）。
+///
+/// 交互：
+///   点击       → 打开（多选模式下为勾选）
+///   长按/点头像 → 进入多选
+///   右滑       → 归档      左滑 → 删除（均可撤销）
+///   星标图标   → 加/去星标
+class GmailStyleMailList extends StatelessWidget {
+  final List<MailItem> items;
+  final Set<String> selected;
+  final String? activeKey;
+  final Future<void> Function() onRefresh;
+  final void Function(MailItem) onTap;
+  final void Function(MailItem) onToggleSelect;
+  final void Function(MailItem) onToggleStar;
+  final void Function(MailItem)? onSwipeArchive;
+  final void Function(MailItem)? onSwipeDelete;
+  final String emptyText;
+  final Widget? header;
 
-  @override
-  State<GmailStyleMailList> createState() => _GmailStyleMailListState();
-}
+  const GmailStyleMailList({
+    super.key,
+    required this.items,
+    required this.selected,
+    required this.onRefresh,
+    required this.onTap,
+    required this.onToggleSelect,
+    required this.onToggleStar,
+    this.onSwipeArchive,
+    this.onSwipeDelete,
+    this.activeKey,
+    this.emptyText = '没有邮件',
+    this.header,
+  });
 
-class _GmailStyleMailListState extends State<GmailStyleMailList> {
-  late final MailSyncService _sync = MailSyncService(widget.user);
-  List<Map<String, dynamic>> _mails = [];
-  bool _loading = true;
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _init();
-  }
-
-  Future<void> _init() async {
-    // 先显示本地（秒开），再后台同步
-    _mails = await _sync.loadList();
-    if (mounted) setState(() => _loading = false);
-    await _refresh();
-  }
-
-  Future<void> _refresh() async {
-    try {
-      await _sync.sync();
-      final list = await _sync.loadList();
-      if (mounted) setState(() {
-        _mails = list;
-        _error = null;
-      });
-    } catch (e) {
-      if (mounted) setState(() => _error = e.toString());
-    }
-  }
+  bool get _selecting => selected.isNotEmpty;
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    // 倒序：最新（seq 最大）在最上
-    final view = _mails.where((m) => m['deleted'] != true).toList().reversed.toList();
-
     return RefreshIndicator(
-      onRefresh: _refresh,
-      child: view.isEmpty
-          ? ListView(children: [
-        const SizedBox(height: 120),
-        Center(child: Text(_error == null ? '收件箱为空' : '同步失败: $_error',
-            style: const TextStyle(color: Colors.grey))),
-      ])
-          : ListView.separated(
-        itemCount: view.length,
-        separatorBuilder: (_, __) => const Divider(height: 1, indent: 72),
-        itemBuilder: (context, i) => _tile(view[i]),
-      ),
+      onRefresh: onRefresh,
+      child: items.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: [
+                if (header != null) header!,
+                const SizedBox(height: 120),
+                Center(
+                  child: Column(children: [
+                    Icon(Icons.mark_email_read_outlined,
+                        size: 56, color: Colors.grey[300]),
+                    const SizedBox(height: 12),
+                    Text(emptyText, style: const TextStyle(color: Colors.grey)),
+                  ]),
+                ),
+              ],
+            )
+          : ListView.builder(
+              physics: const AlwaysScrollableScrollPhysics(),
+              itemCount: items.length + (header == null ? 0 : 1),
+              itemBuilder: (context, i) {
+                if (header != null) {
+                  if (i == 0) return header!;
+                  i -= 1;
+                }
+                return _buildRow(context, items[i]);
+              },
+            ),
     );
   }
 
-  Widget _tile(Map<String, dynamic> m) {
-    final int seq = (m['seq'] as num).toInt();
-    final String subject = (m['subject']?.toString().isNotEmpty ?? false)
-        ? m['subject'].toString()
-        : '(无主题)';
-    final String from = m['from']?.toString() ?? '';
-    String senderName = m['fromName']?.toString() ?? '';
-    if (senderName.isEmpty) {
-      senderName = from.contains('@') ? from.split('@').first : from;
+  Widget _buildRow(BuildContext context, MailItem m) {
+    final tile = _MailTile(
+      item: m,
+      selected: selected.contains(m.key),
+      active: m.key == activeKey,
+      onTap: () => _selecting ? onToggleSelect(m) : onTap(m),
+      onLongPress: () => onToggleSelect(m),
+      onAvatarTap: () => onToggleSelect(m),
+      onStar: m.kind == MailKind.draft ? null : () => onToggleStar(m),
+    );
+    if (_selecting || (onSwipeArchive == null && onSwipeDelete == null)) {
+      return tile;
     }
-    if (senderName.isEmpty) senderName = 'Unknown';
-    final String initial = senderName[0].toUpperCase();
-    final int epoch = (m['dateEpochMillis'] as num?)?.toInt() ?? 0;
-    final bool hasAtt = m['hasAttachments'] == true;
-    final bool parseError = m['parseError'] == true;
-    final String preview = m['preview']?.toString() ?? '';
+    return Dismissible(
+      key: ValueKey('dismiss_${m.key}'),
+      direction: onSwipeArchive == null
+          ? DismissDirection.endToStart
+          : (onSwipeDelete == null
+              ? DismissDirection.startToEnd
+              : DismissDirection.horizontal),
+      background: _swipeBg(Icons.archive_outlined, '归档', Colors.green[600]!,
+          Alignment.centerLeft),
+      secondaryBackground: _swipeBg(Icons.delete_outline, '删除',
+          Colors.red[400]!, Alignment.centerRight),
+      onDismissed: (dir) {
+        if (dir == DismissDirection.startToEnd) {
+          (onSwipeArchive ?? onSwipeDelete)?.call(m);
+        } else {
+          onSwipeDelete?.call(m);
+        }
+      },
+      child: tile,
+    );
+  }
 
-    return ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      leading: CircleAvatar(
-        backgroundColor: parseError ? Colors.grey : Colors.blueAccent,
-        child: Text(initial, style: const TextStyle(color: Colors.white)),
-      ),
-      title: Row(
+  Widget _swipeBg(IconData icon, String label, Color color, Alignment align) {
+    final left = align == Alignment.centerLeft;
+    return Container(
+      color: color,
+      alignment: align,
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Expanded(
-            child: Text(senderName,
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                maxLines: 1, overflow: TextOverflow.ellipsis),
-          ),
-          Text(_smartDate(epoch),
-              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          if (!left) Text(label, style: const TextStyle(color: Colors.white)),
+          if (!left) const SizedBox(width: 8),
+          Icon(icon, color: Colors.white),
+          if (left) const SizedBox(width: 8),
+          if (left) Text(label, style: const TextStyle(color: Colors.white)),
         ],
       ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+    );
+  }
+}
+
+class _MailTile extends StatelessWidget {
+  final MailItem item;
+  final bool selected;
+  final bool active;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final VoidCallback onAvatarTap;
+  final VoidCallback? onStar;
+
+  const _MailTile({
+    required this.item,
+    required this.selected,
+    required this.active,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onAvatarTap,
+    required this.onStar,
+  });
+
+  static const _palette = [
+    Color(0xFF1A73E8), Color(0xFFD93025), Color(0xFF188038),
+    Color(0xFFE37400), Color(0xFF9334E6), Color(0xFF12B5CB),
+    Color(0xFFC5221F), Color(0xFF5F6368),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final m = item;
+    final unread = !m.read;
+    final name = m.displayName;
+    final initial = name.isEmpty ? '?' : name.characters.first.toUpperCase();
+    final color = m.parseError
+        ? Colors.grey
+        : _palette[name.hashCode.abs() % _palette.length];
+
+    Color? bg;
+    if (selected) {
+      bg = const Color(0xFFD3E3FD);
+    } else if (active) {
+      bg = const Color(0xFFF2F6FC);
+    }
+
+    return Material(
+      color: bg ?? Colors.white,
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (hasAtt)
-                const Padding(
-                  padding: EdgeInsets.only(right: 4),
-                  child: Icon(Icons.attach_file, size: 14, color: Colors.grey),
+              GestureDetector(
+                onTap: onAvatarTap,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: selected
+                      ? const CircleAvatar(
+                          key: ValueKey('sel'),
+                          backgroundColor: Color(0xFF1A73E8),
+                          child: Icon(Icons.check, color: Colors.white),
+                        )
+                      : CircleAvatar(
+                          key: const ValueKey('ava'),
+                          backgroundColor: color,
+                          child: m.kind == MailKind.draft
+                              ? const Icon(Icons.edit_note,
+                                  color: Colors.white, size: 20)
+                              : Text(initial,
+                                  style: const TextStyle(color: Colors.white)),
+                        ),
                 ),
-              Expanded(
-                child: Text(subject,
-                    style: const TextStyle(
-                        color: Colors.black87, fontWeight: FontWeight.w600),
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
               ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      Expanded(
+                        child: Text(
+                          name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight:
+                                unread ? FontWeight.bold : FontWeight.w500,
+                            color: m.kind == MailKind.draft
+                                ? const Color(0xFFD93025)
+                                : Colors.black87,
+                          ),
+                        ),
+                      ),
+                      if (m.hasAttachments)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 4),
+                          child: Icon(Icons.attach_file,
+                              size: 14, color: Colors.grey),
+                        ),
+                      const SizedBox(width: 4),
+                      Text(
+                        smartDate(m.epoch),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: unread ? Colors.black87 : Colors.grey,
+                          fontWeight:
+                              unread ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 2),
+                    Text(
+                      m.subject,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.black87,
+                        fontWeight: unread ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    if (m.preview.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        m.preview,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (onStar != null)
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  onPressed: onStar,
+                  icon: Icon(
+                    m.star ? Icons.star : Icons.star_border,
+                    color: m.star ? const Color(0xFFF4B400) : Colors.grey,
+                    size: 20,
+                  ),
+                )
+              else
+                const SizedBox(width: 12),
             ],
-          ),
-          if (preview.isNotEmpty) ...[
-            const SizedBox(height: 2),
-            Text(preview,
-                style: TextStyle(color: Colors.grey[600]),
-                maxLines: 1, overflow: TextOverflow.ellipsis),
-          ],
-        ],
-      ),
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => QccMailDetailPage(
-            sync: _sync,
-            seq: seq,
-            subject: subject,
-            from: from,
-            expectSha256: m['sha256']?.toString(),
           ),
         ),
       ),
     );
   }
+}
 
-  String _smartDate(int ms) {
-    if (ms <= 0) return '';
-    final dt = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
-    final now = DateTime.now();
-    if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
-      return DateFormat('今天 HH:mm').format(dt);     // 今天：今天 14:57
-    }
-    if (dt.year == now.year) {
-      return DateFormat('MM-dd HH:mm').format(dt);    // 今年：06-26 10:31
-    }
-    return DateFormat('yyyy-MM-dd HH:mm').format(dt); // 跨年：2025-12-08 09:31
+/// 列表时间：今天 → HH:mm；今年 → M月d日；跨年 → yyyy/M/d
+String smartDate(int ms) {
+  if (ms <= 0) return '';
+  final dt = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+  final now = DateTime.now();
+  if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
+    return DateFormat('HH:mm').format(dt);
   }
+  if (dt.year == now.year) return DateFormat('M月d日').format(dt);
+  return DateFormat('yyyy/M/d').format(dt);
+}
+
+/// 详情页时间：yyyy年M月d日 HH:mm
+String fullDate(int ms) {
+  if (ms <= 0) return '';
+  return DateFormat('yyyy年M月d日 HH:mm')
+      .format(DateTime.fromMillisecondsSinceEpoch(ms).toLocal());
 }

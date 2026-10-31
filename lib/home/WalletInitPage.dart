@@ -52,7 +52,6 @@ class _WalletInitPageState extends State<WalletInitPage> {
   void initState() {
     super.initState();
     MailUtils.emailid=widget.freeId;
-
     // ✅ 新增：Mac/Win 桌面端启动时，把"原生窗口"本身设置成屏幕物理尺寸的比例并居中，
     // 而不是在 Flutter 内部再缩小内容。这样窗口大小才真正跟你的显示器分辨率挂钩，
     // 13/14 寸小屏和大屏 Mac 拿到的窗口比例是一致的，不会出现"明明屏幕很大却缩得很小"的问题。
